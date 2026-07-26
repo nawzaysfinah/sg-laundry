@@ -1,0 +1,102 @@
+@import "tailwindcss";
+
+/*
+  Design language: a night-sky weather app, not an admin dashboard.
+  One fixed dark palette — a weather app that flips to a white card grid in
+  light mode loses the "looking at the sky" feel, and this is a personal tool
+  used mostly outdoors or on a balcony where dark is easier to read.
+*/
+
+@theme {
+  --color-sky-950: #070d1a;
+  --color-ink: #0b1220;
+  --color-ink-soft: #111c33;
+
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "SF Pro Text", "Segoe UI",
+    Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  background:
+    radial-gradient(1200px 600px at 50% -10%, #1e3a6b 0%, transparent 60%),
+    linear-gradient(180deg, #0b1220 0%, #070d1a 100%);
+  background-attachment: fixed;
+  color: #e8eefc;
+  -webkit-font-smoothing: antialiased;
+  /* Respect the iOS home indicator / notch when installed as a PWA. */
+  padding-bottom: env(safe-area-inset-bottom);
+}
+
+/* ---------------------------------------------------------------------------
+   Leaflet overrides
+   Leaflet ships opinionated light-theme chrome. These pull it into our palette
+   without forking the stylesheet.
+--------------------------------------------------------------------------- */
+
+.leaflet-container {
+  background: #0d1526;
+  font-family: var(--font-sans);
+  /* Leaflet's default z-index stack sits above sticky UI; keep it contained. */
+  z-index: 0;
+}
+
+.leaflet-control-attribution {
+  background: rgba(7, 13, 26, 0.75) !important;
+  color: #8ea3c7 !important;
+  font-size: 10px !important;
+  backdrop-filter: blur(4px);
+}
+
+.leaflet-control-attribution a {
+  color: #a9c2ec !important;
+}
+
+.leaflet-control-zoom a {
+  background: rgba(17, 28, 51, 0.9) !important;
+  color: #e8eefc !important;
+  border-color: rgba(255, 255, 255, 0.12) !important;
+}
+
+.leaflet-control-zoom a:hover {
+  background: rgba(30, 58, 107, 0.95) !important;
+}
+
+/* The home marker pulses gently so it's distinguishable from the active pin. */
+@keyframes home-pulse {
+  0%,
+  100% {
+    opacity: 0.55;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.15;
+    transform: scale(1.6);
+  }
+}
+
+.home-pulse {
+  animation: home-pulse 2.8s ease-in-out infinite;
+  transform-origin: center;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .home-pulse {
+    animation: none;
+  }
+}
+
+/* Hide the number-input spinners in the coordinate readout. */
+input[type="number"]::-webkit-inner-spin-button,
+input[type="number"]::-webkit-outer-spin-button {
+  appearance: none;
+  margin: 0;
+}
