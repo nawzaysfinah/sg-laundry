@@ -194,18 +194,31 @@ you set up VAPID) Web Push channel.
    - Request method GET is fine (POST also works).
 3. Save and enable.
 
-#### Option B — GitHub Actions (already scaffolded)
+#### Option B — GitHub Actions (alternative to Option A, not both)
 
 This repo includes `.github/workflows/check-rain.yml`, which pings the route on
-a 15-minute schedule. To use it:
+a 15-minute schedule. **Only set this up if you're using it instead of
+cron-job.org** — running both just means two schedulers hitting the same
+endpoint.
+
+> **Important:** GitHub activates a `schedule:`-triggered workflow the moment
+> it's on your default branch — there's no separate "enable" step. If you
+> don't configure the two settings below, it runs on schedule anyway and fails
+> every time (harmlessly — it exits before making any network call — but it'll
+> fill your Actions tab with red ✗). If you're using Option A, leave this
+> workflow **disabled**: `gh workflow disable check-rain.yml`, or via
+> **Actions → Check rain near home → ⋯ → Disable workflow** in the GitHub UI.
+
+To use it instead of cron-job.org:
 
 1. Push the repo to GitHub.
 2. In the repo, **Settings → Secrets and variables → Actions**, add:
    - Secret `CRON_SECRET` = your secret
    - Variable `APP_URL` = `https://YOUR-APP.vercel.app`
-3. The workflow runs automatically. (GitHub's scheduler is best-effort and can
-   lag a few minutes under load — fine for this; cron-job.org is more punctual
-   if you care.)
+3. Re-enable it if it was disabled: `gh workflow enable check-rain.yml`.
+4. The workflow runs automatically. (GitHub's scheduler is best-effort and can
+   lag well beyond 15 minutes, especially on a low-activity repo — cron-job.org
+   is far more punctual; that's why it's the default recommendation.)
 
 #### Verify it's wired up
 
