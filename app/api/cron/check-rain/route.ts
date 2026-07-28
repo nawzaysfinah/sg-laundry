@@ -22,17 +22,18 @@
  *   ?test=telegram    send a one-off test message to verify the bot is wired up.
  */
 
-import { timingSafeEqual } from "node:crypto";
 import { NextResponse } from "next/server";
 import { buildForecastView, type ForecastView } from "@/lib/forecast";
 import { LAUNDRY_CONFIG } from "@/lib/laundryLogic";
 import { isPushConfigured, sendNotification, type SendResult } from "@/lib/push";
 import { buildMorningReport, buildRainAlert } from "@/lib/report";
+import { secretMatches } from "@/lib/security";
 import { sgNow, type SgNow } from "@/lib/sgTime";
 import {
   getHome,
   getLastRainAlertAt,
   getLastReportDate,
+  getMutedUntil,
   getSubscriptions,
   isStoreConfigured,
   markNotified,
@@ -45,14 +46,6 @@ import { fetchForecast } from "@/lib/weather";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-
-/** Constant-time secret comparison — avoids leaking the secret via timing. */
-function secretMatches(provided: string, expected: string): boolean {
-  const a = Buffer.from(provided);
-  const b = Buffer.from(expected);
-  if (a.length !== b.length) return false;
-  return timingSafeEqual(a, b);
-}
 
 function authorize(request: Request): boolean {
   const expected = process.env.CRON_SECRET;
@@ -124,6 +117,13 @@ async function maybeSendRainAlert(
   dryRun: boolean
 ): Promise<unknown> {
   const cfg = LAUNDRY_CONFIG.notification;
+
+  // /mute in Telegram takes precedence over everything else — an explicit
+  // "leave me alone" beats even a genuine rain warning until it expires.
+  const mutedUntil = await getMutedUntil();
+  if (mutedUntil && mutedUntil.getTime() > Date.now()) {
+    return { status: "muted", until: mutedUntil.toISOString() };
+  }
 
   if (!withinQuietHours(now.hour)) {
     return {

@@ -75,6 +75,12 @@ export function formatHourShort(isoLocal: string): string {
   return h < 12 ? `${h}am` : `${h - 12}pm`;
 }
 
+/** Format an arbitrary instant as SG wall-clock "HH:MM" (e.g. for "paused until 14:32"). */
+export function formatClock(at: Date): string {
+  const { hour, minute } = sgNow(at);
+  return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+}
+
 /**
  * Index of the current (or next upcoming) hour within an Open-Meteo
  * `hourly.time` array. Returns 0 if the array starts in the future and -1 if it

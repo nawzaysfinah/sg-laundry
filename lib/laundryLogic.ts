@@ -134,6 +134,13 @@ export const LAUNDRY_CONFIG = {
      * Sent exactly once per calendar day (tracked in Redis).
      */
     report: { enabled: true, reportHour: 8, reportWindowHours: 4 },
+
+    /**
+     * How long a /mute command in Telegram pauses rain alerts for. Does not
+     * affect the morning report — /mute is specifically "stop bugging me about
+     * rain right now", not "go silent entirely".
+     */
+    muteDurationMinutes: 120,
   },
 } as const;
 

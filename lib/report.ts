@@ -94,3 +94,42 @@ export function buildRainAlert(
     `${peakProb}% chance within the next ${lookaheadHours}h — bring in your laundry.`
   );
 }
+
+// ---------------------------------------------------------------------------
+// On-demand Telegram command replies (/now, /window, /home)
+// ---------------------------------------------------------------------------
+
+/** Reply to /now — current conditions + drying score at home, on demand. */
+export function buildNowReply(view: ForecastView, home: HomeLocation): string {
+  const { current } = view;
+  const emoji = LEVEL_EMOJI[view.recommendation.level];
+  const nextHourProb = view.timeline[0]?.precipProbPct ?? 0;
+
+  const lines = [
+    `📍 <b>${homeName(home)}</b> — ${Math.round(current.tempC)}°C, ${escapeHtml(current.weatherLabel)}`,
+    `💧 Humidity ${Math.round(current.rh)}% · Wind ${Math.round(current.windKmh)} km/h · Cloud ${Math.round(current.cloudCoverPct)}%`,
+    "",
+    `${emoji} <b>Drying score: ${current.score}/100</b> — ${escapeHtml(view.recommendation.badge)}`,
+    `🌧️ Rain in the next hour: ${nextHourProb}%`,
+    `⏱️ ${escapeHtml(formatDryHours(current.dryHours))}`,
+  ];
+  return lines.join("\n");
+}
+
+/** Reply to /window — just the best-drying-window part of the forecast. */
+export function buildWindowReply(view: ForecastView): string {
+  const { bestWindow, bestWindowIsTomorrow } = view;
+  if (!bestWindow) {
+    return "🕒 No good drying window in the forecast right now — every daylight stretch is either too wet or too humid.";
+  }
+  const when = bestWindowIsTomorrow ? "tomorrow" : "today";
+  return `🕒 <b>Best window ${when}:</b> ${escapeHtml(bestWindow.label)} (${bestWindow.hours}h, avg score ${bestWindow.averageScore})`;
+}
+
+/** Reply to /home — show the saved home location, or say there isn't one. */
+export function buildHomeReply(home: HomeLocation | null): string {
+  if (!home) {
+    return "📍 No home location set yet. Open the web app, drop a pin, and tap “Set this pin as my home.”";
+  }
+  return `📍 <b>Home:</b> ${homeName(home)}\n${home.lat.toFixed(4)}, ${home.lon.toFixed(4)}`;
+}

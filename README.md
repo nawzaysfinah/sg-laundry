@@ -25,6 +25,7 @@ No accounts. No analytics. No trackers. One user — you.
 | **Home & notifications** | Save a home pin, toggle browser rain alerts (Telegram runs automatically once configured — no in-app toggle needed) | Upstash Redis + Web Push |
 | **Telegram — rain alert** | Sent automatically when rain is imminent near home | Cron checker → `lib/telegram.ts` |
 | **Telegram — morning report** | One digest per day (~8am SGT by default): verdict, best window, peak rain | Cron checker → `lib/report.ts` |
+| **Telegram — commands** | `/now` `/report` `/window` `/home` `/mute` `/help` — ask on demand instead of waiting | Webhook → `app/api/telegram/webhook/route.ts` |
 
 > The Windy iframe is a **picture**, not a data source. Every number, threshold
 > and recommendation comes from Open-Meteo. See `components/WindyRadar.tsx`.
@@ -47,15 +48,19 @@ app/
     cron/check-rain/route.ts   GET/POST protected checker — drives Telegram
                                 rain alerts, the daily Telegram report, AND the
                                 dormant Web Push channel, all from one call
+    telegram/webhook/route.ts  POST Telegram command handler (/now, /report,
+                                /window, /home, /mute, /help) — the only inbound
+                                route; verifies a webhook secret + your chat id
 lib/
   laundryLogic.ts   ← the tunable model. All constants live in LAUNDRY_CONFIG.
   forecast.ts          joins Open-Meteo data to the model → the UI view-model
   weather.ts           Open-Meteo client + WMO code descriptions
   geo.ts               Singapore bounding box + coordinate validation
   sgTime.ts            Asia/Singapore time handling (naive-timestamp safe)
+  security.ts           shared constant-time secret comparison (cron + webhook)
   store.ts             Upstash Redis persistence
-  telegram.ts          Telegram Bot API client (primary notification channel)
-  report.ts            pure message builders — rain alert + morning digest text
+  telegram.ts          Telegram Bot API client (send only)
+  report.ts            pure message builders — alerts, morning digest, command replies
   push.ts              web-push sending (server, dormant fallback channel)
   pushClient.ts        browser subscribe/unsubscribe flow (dormant)
 components/            map, panels, search, settings, icons
@@ -93,7 +98,8 @@ configured" note, and the cron route reports each gate it's blocked on.
 This is a one-time setup: steps 1–4 configure services (Upstash, Telegram,
 a cron secret, and optionally Web Push), step 5 sets the env vars and deploys,
 step 6 wires up the external scheduler that actually sends alerts and the
-daily report, and step 7 sets your home location.
+daily report, step 7 sets your home location, and step 8 turns on `/now`,
+`/report`, `/window`, `/home`, `/mute` and `/help` in Telegram.
 
 ### 1. Create a free Upstash Redis database
 
@@ -152,12 +158,18 @@ UPSTASH_REDIS_REST_URL
 UPSTASH_REDIS_REST_TOKEN
 TELEGRAM_BOT_TOKEN
 TELEGRAM_CHAT_ID
+TELEGRAM_WEBHOOK_SECRET
 CRON_SECRET
 # Optional — only if you did step 4:
 VAPID_PUBLIC_KEY
 VAPID_PRIVATE_KEY
 VAPID_SUBJECT
 ```
+
+`TELEGRAM_WEBHOOK_SECRET` is generated the same way as `CRON_SECRET`
+(`openssl rand -hex 32`) — it's what lets `/api/telegram/webhook` tell real
+Telegram traffic apart from anyone else who finds the URL. See step 8 to
+finish wiring it up after deploying.
 
 Then deploy:
 
@@ -265,6 +277,43 @@ channel only; leave it off if you're running Telegram-only.)
 > from a normal Safari tab. Not needed for Telegram, which has no such
 > restriction.
 
+### 8. Register the Telegram commands
+
+Two separate registrations — one tells Telegram where to deliver your
+messages (the webhook), the other tells Telegram what to show in the "/"
+menu (cosmetic, but nice to have).
+
+**a. Point Telegram at your webhook.** One-time API call, using the bot
+token and the `TELEGRAM_WEBHOOK_SECRET` you just deployed:
+
+```bash
+curl -s "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook" \
+  -d "url=https://YOUR-APP.vercel.app/api/telegram/webhook" \
+  -d "secret_token=<TELEGRAM_WEBHOOK_SECRET>"
+```
+
+A `{"ok":true,...}` response confirms it. Telegram will now POST every
+message sent to your bot to that URL — the route ignores anything that isn't
+from your `TELEGRAM_CHAT_ID`, so it's safe even though the bot's username is
+publicly discoverable. You can check the current registration any time with
+`https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/getWebhookInfo`, and remove
+it with `.../deleteWebhook`.
+
+**b. Register the command menu with [@BotFather](https://t.me/BotFather).**
+Message it `/setcommands`, pick your bot, then paste:
+
+```
+now - Current rain & drying conditions at home
+report - Get today's laundry report on demand
+window - Best remaining drying window today
+home - Show your saved home location
+mute - Pause rain alerts for 2 hours
+help - What this bot does and how it works
+```
+
+Now open your bot in Telegram and try `/now` — a real reply should come back
+within a second or two.
+
 ---
 
 ## Tuning the laundry model
@@ -284,7 +333,9 @@ Open `lib/laundryLogic.ts`. Everything lives in `LAUNDRY_CONFIG`:
   (default 90 min), and quiet hours (default 7am–9pm, applies to rain alerts
   only). **`notification.report`** — the morning digest: `reportHour` (default
   8am SGT) and `reportWindowHours` (default 4h catch-up window before it gives
-  up on today and waits for tomorrow).
+  up on today and waits for tomorrow). **`notification.muteDurationMinutes`**
+  (default 120) — how long `/mute` in Telegram pauses rain alerts for; the
+  morning report is unaffected by mute.
 
 No rebuild is needed for the constants to take effect beyond the normal
 Next.js hot reload in dev / redeploy in prod.
@@ -304,9 +355,13 @@ Next.js hot reload in dev / redeploy in prod.
   No analytics or third-party scripts run, beyond the map tiles, the Windy
   radar iframe (sandboxed, `no-referrer`), and the outbound-only Telegram Bot
   API call the cron route makes to deliver alerts.
-- **Telegram bot scope.** The bot never reads messages or handles commands —
-  `lib/telegram.ts` only ever calls `sendMessage`. There's no webhook and no
-  polling loop, so it has no way to receive anything from you or anyone else.
+- **Telegram bot scope.** `lib/telegram.ts` only ever calls `sendMessage` —
+  outbound only. The one inbound surface is `/api/telegram/webhook`, which
+  exists solely to answer the six slash commands; it's gated by a webhook
+  secret Telegram itself attaches to every call, and it silently ignores any
+  message that isn't from your own `TELEGRAM_CHAT_ID` (bot usernames are
+  publicly discoverable on Telegram, so a stranger *can* find and message the
+  bot — they just never get a reply or trigger any state change).
 - **No auth.** This is a single-user tool with one home pin. If you want to lock
   it down, enable Vercel's built-in **Deployment Protection / password** on the
   project — the app needs no code changes for that.

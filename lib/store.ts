@@ -23,6 +23,7 @@ const SUBS_KEY = "laundry:subs";
 // per-subscription hash needed like Web Push has).
 const TG_RAIN_ALERT_KEY = "laundry:tg:lastRainAlertAt"; // ISO timestamp
 const TG_REPORT_DATE_KEY = "laundry:tg:lastReportDate"; // "YYYY-MM-DD" (SG date)
+const TG_MUTED_UNTIL_KEY = "laundry:tg:mutedUntil"; // ISO timestamp, set by /mute
 
 export type HomeLocation = Coords & {
   label?: string;
@@ -200,4 +201,21 @@ export async function setLastReportDate(date: string): Promise<void> {
   const redis = getRedis();
   if (!redis) return;
   await redis.set(TG_REPORT_DATE_KEY, date);
+}
+
+/** Set by the /mute command; rain alerts stay quiet until this time passes. */
+export async function getMutedUntil(): Promise<Date | null> {
+  const redis = getRedis();
+  if (!redis) return null;
+  const raw = await redis.get<string>(TG_MUTED_UNTIL_KEY);
+  return raw ? new Date(raw) : null;
+}
+
+export async function setMutedUntil(until: Date): Promise<void> {
+  const redis = getRedis();
+  if (!redis) return;
+  // TTL the key to the mute duration (+ a small buffer) so a stale timestamp
+  // can never linger in Redis after it's no longer relevant.
+  const ttlSeconds = Math.max(1, Math.ceil((until.getTime() - Date.now()) / 1000) + 60);
+  await redis.set(TG_MUTED_UNTIL_KEY, until.toISOString(), { ex: ttlSeconds });
 }
