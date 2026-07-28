@@ -44,17 +44,6 @@ const pinIcon = L.divIcon({
     </svg>`,
 });
 
-const homeIcon = L.divIcon({
-  className: "",
-  iconSize: [26, 26],
-  iconAnchor: [13, 13],
-  html: `
-    <svg width="26" height="26" viewBox="0 0 26 26" xmlns="http://www.w3.org/2000/svg">
-      <circle class="home-pulse" cx="13" cy="13" r="10" fill="#34d399"/>
-      <circle cx="13" cy="13" r="6" fill="#34d399" stroke="#0b1220" stroke-width="2"/>
-    </svg>`,
-});
-
 /** Translates map clicks into a clamped, rounded selection. */
 function ClickHandler({ onSelect }: { onSelect: (c: Coords) => void }) {
   useMapEvents({
@@ -71,8 +60,8 @@ function ClickHandler({ onSelect }: { onSelect: (c: Coords) => void }) {
  * Keyed on `focusToken` rather than on the coordinates themselves: if we panned
  * whenever `coords` changed, dragging the pin would make the map chase it and
  * fight the user's finger. The token only increments for *external* changes
- * (search result chosen, home restored), which are exactly the cases where
- * recentering is wanted.
+ * (a search result chosen, the last pin restored on load), which are exactly
+ * the cases where recentering is wanted.
  */
 function Recenter({ coords, focusToken }: { coords: Coords; focusToken: number }) {
   const map = useMap();
@@ -115,12 +104,11 @@ function ResizeHandler() {
 
 export type MapLocatorProps = {
   coords: Coords;
-  home: Coords | null;
   focusToken: number;
   onSelect: (coords: Coords) => void;
 };
 
-export default function MapLocator({ coords, home, focusToken, onSelect }: MapLocatorProps) {
+export default function MapLocator({ coords, focusToken, onSelect }: MapLocatorProps) {
   const markerHandlers = useMemo(
     () => ({
       dragend(event: L.DragEndEvent) {
@@ -150,15 +138,6 @@ export default function MapLocator({ coords, home, focusToken, onSelect }: MapLo
       <ClickHandler onSelect={onSelect} />
       <Recenter coords={coords} focusToken={focusToken} />
       <ResizeHandler />
-
-      {home && (
-        <Marker
-          position={[home.lat, home.lon]}
-          icon={homeIcon}
-          interactive={false}
-          zIndexOffset={-100}
-        />
-      )}
 
       <Marker
         position={[coords.lat, coords.lon]}

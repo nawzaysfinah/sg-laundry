@@ -1,26 +1,23 @@
 /**
- * Push subscription management.
+ * Push subscription management (Web Push — dormant fallback channel; Telegram
+ * is the primary way this app delivers alerts, see app/api/telegram/).
  *
- *   POST   /api/subscribe  { subscription, lat?, lon?, label? }
- *          Stores the PushSubscription. If lat/lon are included and no home is
- *          set yet, they're adopted as the home location — so enabling
- *          notifications from a fresh install "just works".
+ *   POST   /api/subscribe  { subscription }
+ *          Stores the PushSubscription.
  *
  *   DELETE /api/subscribe  { endpoint }
  *          Forgets the subscription (the UI toggle calls this).
+ *
+ * There's no UI left that calls this route — the home-setting panel it lived
+ * behind was removed when the app went multi-user via Telegram, since
+ * "home" is now per Telegram chat, not a single value the web app can own.
+ * The route (and the rest of the Web Push machinery) is kept working in case
+ * it's ever revived.
  */
 
 import { NextResponse } from "next/server";
-import { parseCoords } from "@/lib/geo";
 import { isPushConfigured, isValidSubscription } from "@/lib/push";
-import {
-  deleteSubscription,
-  getHome,
-  isStoreConfigured,
-  saveSubscription,
-  setHome,
-  subscriptionKey,
-} from "@/lib/store";
+import { deleteSubscription, isStoreConfigured, saveSubscription, subscriptionKey } from "@/lib/store";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -39,7 +36,7 @@ export async function POST(request: Request) {
     );
   }
 
-  let body: { subscription?: unknown; lat?: unknown; lon?: unknown; label?: unknown };
+  let body: { subscription?: unknown };
   try {
     body = await request.json();
   } catch {
@@ -52,17 +49,6 @@ export async function POST(request: Request) {
 
   try {
     const key = await saveSubscription(body.subscription);
-
-    // Adopt the current pin as home if we don't have one yet.
-    const coords = parseCoords(body.lat, body.lon);
-    if (coords && !(await getHome())) {
-      const label =
-        typeof body.label === "string" && body.label.trim()
-          ? body.label.trim().slice(0, 60)
-          : undefined;
-      await setHome(coords, label);
-    }
-
     return NextResponse.json({ ok: true, key });
   } catch (err) {
     console.error("[subscribe] save failed", err);

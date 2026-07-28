@@ -1,15 +1,18 @@
 # 🌧️ SG Laundry — Singapore Rain & Laundry Advisor
 
-Drop a pin anywhere in Singapore to see current & upcoming rain, a transparent
-laundry-drying recommendation, and — via Telegram — a rain-incoming alert and a
-daily morning digest telling you whether it's a good day to hang laundry.
+A web app to browse rain conditions and laundry-drying advice anywhere in
+Singapore, plus a Telegram bot anyone can message to register a location and
+get a rain-incoming alert and a daily morning digest for it.
 
 Built to run at **$0/month**: Next.js on Vercel Hobby, Open-Meteo for weather
 (no key), CARTO map tiles (no key), a Windy embed for the visual radar, Upstash
 Redis free tier for the tiny bit of state, and a Telegram bot for alerts (Web
 Push is also in the codebase as a dormant fallback channel — see below).
 
-No accounts. No analytics. No trackers. One user — you.
+No accounts, no analytics, no trackers. The web app is a stateless locator —
+open it, look up any point, nothing is saved. The Telegram bot is the stateful
+part: each chat that messages it gets its own registered location, independent
+of everyone else's.
 
 ---
 
@@ -22,9 +25,9 @@ No accounts. No analytics. No trackers. One user — you.
 | **Current conditions** | Temp, humidity, wind, cloud, UV in plain language | Open-Meteo `current` + `hourly` |
 | **Rain timeline** | Colour-coded rain-probability bars for the next 12 hours | Open-Meteo `hourly` |
 | **Live rain radar** | Windy radar loop, centred on the pin (**visual only**) | Windy embed |
-| **Home & notifications** | Save a home pin, toggle browser rain alerts (Telegram runs automatically once configured — no in-app toggle needed) | Upstash Redis + Web Push |
-| **Telegram — rain alert** | Sent automatically when rain is imminent near home | Cron checker → `lib/telegram.ts` |
-| **Telegram — morning report** | One digest per day (~8am SGT by default): verdict, best window, peak rain | Cron checker → `lib/report.ts` |
+| **Telegram — onboarding** | Share a Telegram Location to register it; `/setlocation` any time to change it, `/stop` to delete your data | Webhook → `app/api/telegram/webhook/route.ts` |
+| **Telegram — rain alert** | Sent automatically to each registered chat when rain is imminent near *their* location | Cron checker → `lib/telegram.ts` |
+| **Telegram — morning report** | One digest per day per chat (~8am SGT by default): verdict, best window, peak rain | Cron checker → `lib/report.ts` |
 | **Telegram — commands** | `/now` `/report` `/window` `/home` `/mute` `/help` — ask on demand instead of waiting | Webhook → `app/api/telegram/webhook/route.ts` |
 
 > The Windy iframe is a **picture**, not a data source. Every number, threshold
@@ -42,15 +45,17 @@ app/
   api/
     weather/route.ts           GET  proxy → Open-Meteo forecast (built view-model)
     geocode/route.ts           GET  proxy → Open-Meteo geocoding (SG only)
-    home/route.ts              GET/POST/DELETE home location
     subscribe/route.ts         POST/DELETE push subscription (Web Push, dormant)
     push/public-key/route.ts   GET  VAPID public key (Web Push, dormant)
-    cron/check-rain/route.ts   GET/POST protected checker — drives Telegram
-                                rain alerts, the daily Telegram report, AND the
+    cron/check-rain/route.ts   GET/POST protected checker — loops over every
+                                registered Telegram chat, sending each its own
+                                rain alert / morning report; also touches the
                                 dormant Web Push channel, all from one call
-    telegram/webhook/route.ts  POST Telegram command handler (/now, /report,
-                                /window, /home, /mute, /help) — the only inbound
-                                route; verifies a webhook secret + your chat id
+    telegram/webhook/route.ts  POST Telegram command + location handler
+                                (/setlocation, /now, /report, /window, /home,
+                                /mute, /stop, /help) — the only inbound route;
+                                open to any Telegram chat, gated by a webhook
+                                secret rather than an allowlist
 lib/
   laundryLogic.ts   ← the tunable model. All constants live in LAUNDRY_CONFIG.
   forecast.ts          joins Open-Meteo data to the model → the UI view-model
@@ -58,12 +63,12 @@ lib/
   geo.ts               Singapore bounding box + coordinate validation
   sgTime.ts            Asia/Singapore time handling (naive-timestamp safe)
   security.ts           shared constant-time secret comparison (cron + webhook)
-  store.ts             Upstash Redis persistence
-  telegram.ts          Telegram Bot API client (send only)
+  store.ts             Upstash Redis persistence — per-Telegram-chat hashes
+  telegram.ts          Telegram Bot API client (send only, any chat id)
   report.ts            pure message builders — alerts, morning digest, command replies
   push.ts              web-push sending (server, dormant fallback channel)
   pushClient.ts        browser subscribe/unsubscribe flow (dormant)
-components/            map, panels, search, settings, icons
+components/            map, panels, search — the stateless locator UI
 public/
   sw.js                service worker (push delivery only — no offline caching)
   icons/               generated PWA icons
@@ -87,9 +92,9 @@ npm run dev
 
 Open <http://localhost:3000>. The map, forecast, laundry advisor, timeline and
 radar all work **with no configuration at all** — Open-Meteo and CARTO need no
-keys. Only the *home location* and *notifications* (Telegram or Web Push) need
-the env vars below; until you set them the settings panel shows a friendly "not
-configured" note, and the cron route reports each gate it's blocked on.
+keys, and the web app never touches Redis or Telegram. Only the Telegram bot
+(onboarding, commands, alerts) needs the env vars below; until they're set the
+webhook and cron routes report `"not-configured"` rather than erroring.
 
 ---
 
@@ -97,9 +102,10 @@ configured" note, and the cron route reports each gate it's blocked on.
 
 This is a one-time setup: steps 1–4 configure services (Upstash, Telegram,
 a cron secret, and optionally Web Push), step 5 sets the env vars and deploys,
-step 6 wires up the external scheduler that actually sends alerts and the
-daily report, step 7 sets your home location, and step 8 turns on `/now`,
-`/report`, `/window`, `/home`, `/mute` and `/help` in Telegram.
+step 6 wires up the external scheduler that actually sends alerts and daily
+reports, and step 7 turns the bot on and registers its commands. After that,
+*you* (and anyone else) register a location by messaging the bot — there's no
+separate "set your home" step for the deployer to do.
 
 ### 1. Create a free Upstash Redis database
 
@@ -110,7 +116,7 @@ daily report, step 7 sets your home location, and step 8 turns on `/now`,
    - `UPSTASH_REDIS_REST_URL`
    - `UPSTASH_REDIS_REST_TOKEN`
 
-### 2. Create a Telegram bot and get your chat ID
+### 2. Create a Telegram bot
 
 This is the primary notification channel — no APNs/VAPID complexity, no
 PWA-install requirement, works identically on phone/desktop.
@@ -118,12 +124,11 @@ PWA-install requirement, works identically on phone/desktop.
 1. In Telegram, message **[@BotFather](https://t.me/BotFather)** → `/newbot` →
    follow the prompts (any name/username). It replies with a token that looks
    like `123456789:AAH...xyz` — that's `TELEGRAM_BOT_TOKEN`.
-2. Message **your new bot** anything (e.g. "hi") — Telegram bots can't message
-   you until you've messaged them first.
-3. Get your numeric chat ID. Easiest way: message **[@userinfobot](https://t.me/userinfobot)**
-   — it replies with your `Id`. That's `TELEGRAM_CHAT_ID`.
-   (Alternative: open `https://api.telegram.org/bot<TOKEN>/getUpdates` in a
-   browser after step 2 and read `message.chat.id` from the JSON.)
+
+That's the only credential this step produces. The bot is multi-user — anyone
+who finds it can register their own location — so there's no "your chat ID"
+to look up as part of deployment; you'll register yourself the same way
+everyone else does, in step 7.
 
 ### 3. Generate a cron secret
 
@@ -157,7 +162,6 @@ Preview):
 UPSTASH_REDIS_REST_URL
 UPSTASH_REDIS_REST_TOKEN
 TELEGRAM_BOT_TOKEN
-TELEGRAM_CHAT_ID
 TELEGRAM_WEBHOOK_SECRET
 CRON_SECRET
 # Optional — only if you did step 4:
@@ -188,10 +192,11 @@ set the env vars before the first production build.)
 and aren't time-precise — a sub-daily entry in `vercel.json` is rejected at
 deploy time. Rain warnings and a timely morning report are useless at that
 cadence, so the checker is a normal protected route driven by a free external
-scheduler every 15–30 minutes. Every run does three things in one call: sends
-a Telegram rain alert if warranted, sends the once-daily Telegram morning
-report if it's the right time and not sent yet, and checks the (empty, unless
-you set up VAPID) Web Push channel.
+scheduler every 15–30 minutes. Every run loops over every chat that has
+registered a location and, for each one independently: sends a rain alert if
+warranted, sends the once-daily morning report if it's the right time and not
+sent yet; it also checks the (empty, unless you set up VAPID) Web Push channel
+once.
 
 #### Option A — cron-job.org (easiest)
 
@@ -234,11 +239,14 @@ To use it instead of cron-job.org:
 
 #### Verify it's wired up
 
-Two quick checks, both secret-protected:
+Two quick checks, both secret-protected. Message your own bot once first (any
+text) so Telegram knows your chat exists, then find your numeric chat id via
+**[@userinfobot](https://t.me/userinfobot)** — you only need this for the test
+below, not for anything the app stores.
 
 ```bash
-# 1. Confirm the bot itself works — sends a real "✅ wired up correctly" message.
-curl -s "https://YOUR-APP.vercel.app/api/cron/check-rain?test=telegram" \
+# 1. Confirm the bot can actually reach a chat — sends a real test message.
+curl -s "https://YOUR-APP.vercel.app/api/cron/check-rain?test=telegram&chatId=YOUR_CHAT_ID" \
   -H "Authorization: Bearer YOUR_CRON_SECRET"
 
 # 2. Dry-run the full checker — reports what WOULD send, sends nothing.
@@ -246,42 +254,36 @@ curl -s "https://YOUR-APP.vercel.app/api/cron/check-rain?dry=1" \
   -H "Authorization: Bearer YOUR_CRON_SECRET" | jq
 ```
 
-The dry-run gives you a breakdown per channel, e.g.:
+Before anyone has registered a location, the dry-run reads
+`{"checked":false,"reason":"no-registered-users"}` — that's expected; it fills
+in once at least one chat has sent `/setlocation` (step 7). Once it does, you
+get a breakdown per registered chat, e.g.:
 
 ```json
 {
   "checked": true,
   "sgTime": "2026-07-28T08:05",
-  "report": "would-send",
-  "rainAlert": { "status": "below-threshold", "peakProb": 12, "threshold": 40 },
+  "userCount": 1,
+  "users": [
+    {
+      "chatId": "987654321",
+      "home": { "lat": 1.3521, "lon": 103.8198 },
+      "report": "would-send",
+      "rainAlert": { "status": "below-threshold", "peakProb": 12, "threshold": 40 }
+    }
+  ],
   "push": "no-subscriptions"
 }
 ```
 
-`report`/`rainAlert` will read `"telegram-not-configured"` until step 2 is done,
-and everything reads `{"checked":false,"reason":"no-home-location"}` until you've
-saved a home (step 7 below). A `401` overall means the `CRON_SECRET` doesn't
-match.
+A `401` overall means the `CRON_SECRET` doesn't match.
 
-### 7. Set your home location
+### 7. Turn the bot on
 
-Open the deployed site, drop the pin on your home, and tap **"Set this pin as
-my home"** in the Home & Notifications panel. That's the point the checker
-watches — no browser permission prompt needed, since Telegram doesn't require
-one. (The **Rain alerts** toggle in that panel is for the dormant Web Push
-channel only; leave it off if you're running Telegram-only.)
-
-> **If you also enabled Web Push (step 4):** on iOS, Safari only allows push
-> for **installed** web apps — Share → **Add to Home Screen**, launch from the
-> icon, then enable the toggle. The app detects and explains this if you try
-> from a normal Safari tab. Not needed for Telegram, which has no such
-> restriction.
-
-### 8. Register the Telegram commands
-
-Two separate registrations — one tells Telegram where to deliver your
-messages (the webhook), the other tells Telegram what to show in the "/"
-menu (cosmetic, but nice to have).
+Two separate registrations — one tells Telegram where to deliver messages
+(the webhook), the other tells Telegram what to show in the "/" menu
+(cosmetic, but nice to have) — then you (and anyone else) register by talking
+to the bot directly.
 
 **a. Point Telegram at your webhook.** One-time API call, using the bot
 token and the `TELEGRAM_WEBHOOK_SECRET` you just deployed:
@@ -292,27 +294,33 @@ curl -s "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook" \
   -d "secret_token=<TELEGRAM_WEBHOOK_SECRET>"
 ```
 
-A `{"ok":true,...}` response confirms it. Telegram will now POST every
-message sent to your bot to that URL — the route ignores anything that isn't
-from your `TELEGRAM_CHAT_ID`, so it's safe even though the bot's username is
-publicly discoverable. You can check the current registration any time with
-`https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/getWebhookInfo`, and remove
-it with `.../deleteWebhook`.
+A `{"ok":true,...}` response confirms it. Telegram will now POST every message
+sent to your bot to that URL. The bot is open to anyone who finds it — the
+webhook secret proves a request genuinely came from Telegram, not that it came
+from any particular person. You can check the current registration any time
+with `https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/getWebhookInfo`, and
+remove it with `.../deleteWebhook`.
 
 **b. Register the command menu with [@BotFather](https://t.me/BotFather).**
 Message it `/setcommands`, pick your bot, then paste:
 
 ```
-now - Current rain & drying conditions at home
+now - Current rain & drying conditions
 report - Get today's laundry report on demand
 window - Best remaining drying window today
-home - Show your saved home location
+home - Show your saved location
+setlocation - Set or change the location I watch
 mute - Pause rain alerts for 2 hours
+stop - Delete your data and stop all alerts
 help - What this bot does and how it works
 ```
 
-Now open your bot in Telegram and try `/now` — a real reply should come back
-within a second or two.
+**c. Register a location.** Open your bot in Telegram and send `/start`, then
+tap 📎 → **Location** and share where you want it to watch (must be within
+Singapore). You'll get a confirmation, and from then on that chat gets its own
+rain alerts and daily report. Try `/now` too — a real reply should come back
+within a second or two. Anyone else who finds the bot does the exact same
+thing to register their own, independent location.
 
 ---
 
@@ -349,22 +357,33 @@ Next.js hot reload in dev / redeploy in prod.
   Punggol, Sentosa…), but its gazetteer is incomplete — a few names (e.g.
   *Clementi*, *Queenstown*) simply aren't in it. When search finds nothing, just
   tap the map: the pin is the primary control, search is a convenience.
-- **Privacy.** Your coordinates only ever go to your own Vercel functions, which
-  proxy Open-Meteo — your device's IP is never handed to the weather API
-  alongside your home location. Coordinates are rounded to ~11m before storage.
-  No analytics or third-party scripts run, beyond the map tiles, the Windy
-  radar iframe (sandboxed, `no-referrer`), and the outbound-only Telegram Bot
-  API call the cron route makes to deliver alerts.
-- **Telegram bot scope.** `lib/telegram.ts` only ever calls `sendMessage` —
-  outbound only. The one inbound surface is `/api/telegram/webhook`, which
-  exists solely to answer the six slash commands; it's gated by a webhook
-  secret Telegram itself attaches to every call, and it silently ignores any
-  message that isn't from your own `TELEGRAM_CHAT_ID` (bot usernames are
-  publicly discoverable on Telegram, so a stranger *can* find and message the
-  bot — they just never get a reply or trigger any state change).
-- **No auth.** This is a single-user tool with one home pin. If you want to lock
-  it down, enable Vercel's built-in **Deployment Protection / password** on the
-  project — the app needs no code changes for that.
+- **Privacy.** Coordinates only ever go to your own Vercel functions, which
+  proxy Open-Meteo — a browser's or bot user's IP is never handed to the
+  weather API alongside a location. Coordinates are rounded to ~11m before
+  storage. No analytics or third-party scripts run, beyond the map tiles, the
+  Windy radar iframe (sandboxed, `no-referrer`), and the outbound-only
+  Telegram Bot API calls the app makes to deliver alerts.
+- **The bot is open to anyone on Telegram, by design.** Bot usernames are
+  publicly discoverable, and there's no allowlist — the webhook (see
+  `app/api/telegram/webhook/route.ts`) is gated only by a secret Telegram
+  itself attaches to every genuine call, which proves the *request* is really
+  from Telegram, not that any particular *person* is messaging it. Anyone who
+  finds the bot can register a Singapore location and start getting alerts for
+  it, independent of everyone else's. Each chat only ever gets its own data
+  (its location, its cooldowns, its mute state) — there's no way for one chat
+  to see or affect another's, and `/stop` deletes a chat's data completely.
+  This is a deliberate, low-risk trade-off: registering just gets someone
+  one-way weather alerts for a place they chose, on infrastructure that costs
+  nothing either way. If you'd rather restrict it to people you approve, you'd
+  need to add an allowlist check to the webhook route yourself (compare the
+  incoming chat id against a list, similar to how `CRON_SECRET` gates the
+  cron route today).
+- **The web app has no accounts and saves nothing server-side.** It's a
+  stateless locator — anyone with the URL can browse any point in Singapore,
+  but there's no login, no per-visitor data, and no link between a browser
+  session and any Telegram chat. If you want to keep the whole site private,
+  enable Vercel's built-in **Deployment Protection / password** on the
+  project — no code changes needed for that.
 - **Timezone.** All forecast logic runs in `Asia/Singapore` using naive local
   timestamps (see `lib/sgTime.ts` for why that matters on a UTC serverless
   host).

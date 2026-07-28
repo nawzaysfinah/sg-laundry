@@ -9,36 +9,36 @@
  * route driven by an external free scheduler (cron-job.org / GitHub Actions)
  * every 15-30 minutes. See the README for that setup.
  *
- * One scheduler drives THREE things each run:
+ * Multi-user: every run loops over every chat that has registered a location
+ * (via /setlocation in Telegram) and, for each one independently:
  *   1. Morning report — a once-daily Telegram digest at/after `report.reportHour`.
- *   2. Rain alert     — a Telegram alert when rain is imminent near home.
- *   3. Web Push       — the original browser-push channel, now DORMANT: it only
- *                       fires if browser subscriptions exist (with Telegram as
- *                       the primary channel there usually are none, so it no-ops).
+ *   2. Rain alert     — a Telegram alert when rain is imminent near that chat's home.
+ * Web Push (the dormant fallback channel) is checked once, separately — it has
+ * no per-chat location concept, and in practice has zero subscribers.
  *
  * Query params:
- *   ?dry=1            run everything and report what WOULD send, sending nothing
- *                     and touching no cooldown/date state.
- *   ?test=telegram    send a one-off test message to verify the bot is wired up.
+ *   ?dry=1                run everything and report what WOULD send, sending
+ *                         nothing and touching no cooldown/date state.
+ *   ?test=telegram&chatId=123   send a one-off test message to a specific chat,
+ *                         to verify the bot can actually reach it.
  */
 
 import { NextResponse } from "next/server";
 import { buildForecastView, type ForecastView } from "@/lib/forecast";
 import { LAUNDRY_CONFIG } from "@/lib/laundryLogic";
-import { isPushConfigured, sendNotification, type SendResult } from "@/lib/push";
+import { isPushConfigured } from "@/lib/push";
 import { buildMorningReport, buildRainAlert } from "@/lib/report";
 import { secretMatches } from "@/lib/security";
 import { sgNow, type SgNow } from "@/lib/sgTime";
 import {
-  getHome,
-  getLastRainAlertAt,
-  getLastReportDate,
-  getMutedUntil,
+  getAllUserHomes,
   getSubscriptions,
+  getUserLastRainAlertAt,
+  getUserLastReportDate,
+  getUserMutedUntil,
   isStoreConfigured,
-  markNotified,
-  setLastRainAlertAt,
-  setLastReportDate,
+  setUserLastRainAlertAt,
+  setUserLastReportDate,
   type HomeLocation,
 } from "@/lib/store";
 import { isTelegramConfigured, sendTelegram } from "@/lib/telegram";
@@ -78,17 +78,19 @@ function peakLookaheadProb(view: ForecastView, lookaheadHours: number): number {
 }
 
 // ---------------------------------------------------------------------------
-// 1. Morning report — once per day, its own time window, ignores quiet hours.
+// 1. Morning report — once per day per chat, its own time window, ignores
+//    quiet hours (a digest arriving at 8am isn't the kind of thing quiet
+//    hours exist to prevent).
 // ---------------------------------------------------------------------------
 async function maybeSendReport(
   view: ForecastView,
   home: HomeLocation,
+  chatId: string,
   now: SgNow,
   dryRun: boolean
 ): Promise<unknown> {
   const r = LAUNDRY_CONFIG.notification.report;
   if (!r.enabled) return "disabled";
-  if (!isTelegramConfigured()) return "telegram-not-configured";
 
   // Only inside the morning catch-up window, so a scheduler that was down all
   // morning doesn't fire a "good morning" digest in the afternoon.
@@ -96,23 +98,24 @@ async function maybeSendReport(
     return { status: "outside-window", reportHour: r.reportHour, windowHours: r.reportWindowHours };
   }
 
-  if ((await getLastReportDate()) === now.date) return "already-sent-today";
+  if ((await getUserLastReportDate(chatId)) === now.date) return "already-sent-today";
   if (dryRun) return "would-send";
 
-  const res = await sendTelegram(buildMorningReport(view, home, now.date));
+  const res = await sendTelegram(chatId, buildMorningReport(view, home, now.date));
   if (res.ok) {
-    await setLastReportDate(now.date);
+    await setUserLastReportDate(chatId, now.date);
     return "sent";
   }
   return { status: "failed", error: res.error };
 }
 
 // ---------------------------------------------------------------------------
-// 2. Rain alert — quiet hours + threshold + single-chat cooldown.
+// 2. Rain alert — mute, then quiet hours, then threshold, then per-chat cooldown.
 // ---------------------------------------------------------------------------
 async function maybeSendRainAlert(
   view: ForecastView,
   home: HomeLocation,
+  chatId: string,
   now: SgNow,
   dryRun: boolean
 ): Promise<unknown> {
@@ -120,7 +123,7 @@ async function maybeSendRainAlert(
 
   // /mute in Telegram takes precedence over everything else — an explicit
   // "leave me alone" beats even a genuine rain warning until it expires.
-  const mutedUntil = await getMutedUntil();
+  const mutedUntil = await getUserMutedUntil(chatId);
   if (mutedUntil && mutedUntil.getTime() > Date.now()) {
     return { status: "muted", until: mutedUntil.toISOString() };
   }
@@ -136,11 +139,8 @@ async function maybeSendRainAlert(
   if (peakProb < cfg.precipProbThresholdPct) {
     return { status: "below-threshold", peakProb, threshold: cfg.precipProbThresholdPct };
   }
-  if (!isTelegramConfigured()) {
-    return { status: "would-alert", peakProb, note: "telegram-not-configured" };
-  }
 
-  const last = await getLastRainAlertAt();
+  const last = await getUserLastRainAlertAt(chatId);
   if (last) {
     const elapsed = Date.now() - last.getTime();
     const cooldownMs = cfg.cooldownMinutes * 60_000;
@@ -155,61 +155,42 @@ async function maybeSendRainAlert(
 
   if (dryRun) return { status: "would-send", peakProb };
 
-  const res = await sendTelegram(buildRainAlert(peakProb, cfg.lookaheadHours, home));
+  const res = await sendTelegram(chatId, buildRainAlert(peakProb, cfg.lookaheadHours, home));
   if (res.ok) {
-    await setLastRainAlertAt();
+    await setUserLastRainAlertAt(chatId);
     return { status: "sent", peakProb };
   }
   return { status: "failed", peakProb, error: res.error };
 }
 
-// ---------------------------------------------------------------------------
-// 3. Web Push — dormant fallback. No-ops unless browser subscriptions exist.
-// ---------------------------------------------------------------------------
-async function maybeSendWebPush(
-  view: ForecastView,
-  now: SgNow,
-  dryRun: boolean
-): Promise<unknown> {
-  if (!withinQuietHours(now.hour)) return "quiet-hours";
+/** Runs both checks for one chat's home and packages the result for the response. */
+async function checkUser(chatId: string, home: HomeLocation, now: SgNow, dryRun: boolean) {
+  const raw = await fetchForecast(home, { revalidate: 0 });
+  const view = buildForecastView(home, raw);
 
+  const [report, rainAlert] = await Promise.all([
+    maybeSendReport(view, home, chatId, now, dryRun),
+    maybeSendRainAlert(view, home, chatId, now, dryRun),
+  ]);
+
+  return { chatId, home: { lat: home.lat, lon: home.lon }, report, rainAlert };
+}
+
+// ---------------------------------------------------------------------------
+// 3. Web Push — dormant fallback, no per-chat location. No-ops unless browser
+//    subscriptions exist, which in practice they never do.
+// ---------------------------------------------------------------------------
+async function maybeSendWebPush(now: SgNow, dryRun: boolean): Promise<unknown> {
   const entries = Object.entries(await getSubscriptions());
   if (entries.length === 0) return "no-subscriptions";
   if (!isPushConfigured()) return "push-not-configured";
+  if (!withinQuietHours(now.hour)) return "quiet-hours";
 
-  const cfg = LAUNDRY_CONFIG.notification;
-  const peakProb = peakLookaheadProb(view, cfg.lookaheadHours);
-  if (peakProb < cfg.precipProbThresholdPct) {
-    return { status: "below-threshold", peakProb };
-  }
-
-  const cooldownMs = cfg.cooldownMinutes * 60_000;
-  const nowMs = Date.now();
-  const payload = {
-    title: "🌧️ Rain likely near home",
-    body: `${peakProb}% chance within the next ${cfg.lookaheadHours}h — bring in your laundry.`,
-    tag: "rain-incoming",
-    url: "/",
-  };
-
-  const results: Array<SendResult | { key: string; status: "cooldown" | "would-send" }> = [];
-  for (const [key, record] of entries) {
-    if (record.lastNotifiedAt) {
-      const elapsed = nowMs - new Date(record.lastNotifiedAt).getTime();
-      if (elapsed < cooldownMs) {
-        results.push({ key, status: "cooldown" });
-        continue;
-      }
-    }
-    if (dryRun) {
-      results.push({ key, status: "would-send" });
-      continue;
-    }
-    const result = await sendNotification(key, record, payload);
-    if (result.status === "sent") await markNotified(key, new Date(nowMs));
-    results.push(result);
-  }
-  return { peakProb, results };
+  // Web Push subscriptions have never carried their own location — this
+  // channel predates the multi-user Telegram redesign and has no coherent
+  // "home" to check rain against anymore. If it ever gets real subscribers
+  // again, it needs its own location model; until then this is a no-op.
+  return { status: "no-location-model", subscriberCount: entries.length };
 }
 
 // ---------------------------------------------------------------------------
@@ -226,40 +207,40 @@ async function handle(request: Request) {
   const dryRun = url.searchParams.get("dry") === "1";
   const now = sgNow();
 
-  // ---- Diagnostic: verify the Telegram bot is wired up --------------------
+  // ---- Diagnostic: verify the bot can reach a specific chat ---------------
   if (url.searchParams.get("test") === "telegram") {
+    const chatId = url.searchParams.get("chatId");
+    if (!chatId) {
+      return NextResponse.json({ error: "?chatId= is required for this test" }, { status: 400 });
+    }
     if (!isTelegramConfigured()) {
       return NextResponse.json({ error: "Telegram not configured" }, { status: 503 });
     }
     const res = await sendTelegram(
+      chatId,
       "✅ <b>SG Laundry</b> test message — your bot is wired up correctly."
     );
-    return NextResponse.json({ test: "telegram", ...res }, { status: res.ok ? 200 : 502 });
+    return NextResponse.json({ test: "telegram", chatId, ...res }, { status: res.ok ? 200 : 502 });
   }
 
-  const home = await getHome();
-  if (!home) {
-    return NextResponse.json({ checked: false, reason: "no-home-location" });
+  const homes = await getAllUserHomes();
+  const entries = Object.entries(homes);
+
+  if (entries.length === 0) {
+    return NextResponse.json({ checked: false, reason: "no-registered-users" });
   }
 
-  // One fresh forecast (cache bypassed) feeds all three channels. The UI is
-  // happy with a 5-minute-old response; the checker must see current data.
-  const raw = await fetchForecast(home, { revalidate: 0 });
-  const view = buildForecastView(home, raw);
-
-  const [report, rainAlert, push] = await Promise.all([
-    maybeSendReport(view, home, now, dryRun),
-    maybeSendRainAlert(view, home, now, dryRun),
-    maybeSendWebPush(view, now, dryRun),
+  const [users, push] = await Promise.all([
+    Promise.all(entries.map(([chatId, home]) => checkUser(chatId, home, now, dryRun))),
+    maybeSendWebPush(now, dryRun),
   ]);
 
   return NextResponse.json({
     checked: true,
     dryRun,
     sgTime: now.hourKey,
-    home: { lat: home.lat, lon: home.lon },
-    report,
-    rainAlert,
+    userCount: users.length,
+    users,
     push,
   });
 }

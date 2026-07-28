@@ -129,7 +129,7 @@ export function buildWindowReply(view: ForecastView): string {
 /** Reply to /home — show the saved home location, or say there isn't one. */
 export function buildHomeReply(home: HomeLocation | null): string {
   if (!home) {
-    return "📍 No home location set yet. Open the web app, drop a pin, and tap “Set this pin as my home.”";
+    return "📍 You haven't set a location yet. Send /setlocation to get started.";
   }
-  return `📍 <b>Home:</b> ${homeName(home)}\n${home.lat.toFixed(4)}, ${home.lon.toFixed(4)}`;
+  return `📍 <b>Location:</b> ${homeName(home)}\n${home.lat.toFixed(4)}, ${home.lon.toFixed(4)}`;
 }

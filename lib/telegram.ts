@@ -1,18 +1,17 @@
 /**
  * Telegram Bot API client (server side only).
  *
- * Outbound-only: this app sends messages to one chat (yours). It never reads
- * updates or handles commands — there's no webhook, no polling, nothing
- * inbound. That keeps it a pure notification sink with no attack surface.
+ * Multi-user: this sends to *any* chat id the caller supplies — there's no
+ * single "the" configured recipient anymore, since any Telegram user who
+ * registers a location becomes a valid target. The one env var this module
+ * needs is the bot's own token; everything else is per-call.
  *
- * Configuration is two env vars, mirroring how store.ts / push.ts degrade when
- * unset so the rest of the app keeps working without Telegram:
- *   TELEGRAM_BOT_TOKEN  — from @BotFather
- *   TELEGRAM_CHAT_ID    — your personal chat id (see README)
+ * Inbound handling (commands, location shares) lives in
+ * app/api/telegram/webhook/route.ts — this file only ever calls `sendMessage`.
  */
 
 export function isTelegramConfigured(): boolean {
-  return Boolean(process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_CHAT_ID);
+  return Boolean(process.env.TELEGRAM_BOT_TOKEN);
 }
 
 export type TelegramResult =
@@ -20,7 +19,7 @@ export type TelegramResult =
   | { ok: false; error: string };
 
 /**
- * Send a message to the configured chat.
+ * Send a message to a specific chat.
  *
  * Uses HTML parse mode (simpler and safer to escape than MarkdownV2, which
  * requires escaping a long list of punctuation). Callers that include dynamic
@@ -30,12 +29,12 @@ export type TelegramResult =
  * morning report so the daily digest doesn't buzz like an urgent alert.
  */
 export async function sendTelegram(
+  chatId: string,
   text: string,
   { disableNotification = false }: { disableNotification?: boolean } = {}
 ): Promise<TelegramResult> {
   const token = process.env.TELEGRAM_BOT_TOKEN;
-  const chatId = process.env.TELEGRAM_CHAT_ID;
-  if (!token || !chatId) {
+  if (!token) {
     return { ok: false, error: "Telegram is not configured" };
   }
 
@@ -56,8 +55,7 @@ export async function sendTelegram(
 
     if (!res.ok) {
       // Telegram returns a JSON body with `description` explaining the failure
-      // (bad token, wrong chat_id, bot blocked, etc.) — surface it for the
-      // ?test=telegram diagnostic.
+      // (bad token, chat not found, bot blocked by that user, etc.).
       const body = (await res.json().catch(() => null)) as
         | { description?: string }
         | null;

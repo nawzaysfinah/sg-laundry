@@ -70,30 +70,6 @@ body {
   background: rgba(30, 58, 107, 0.95) !important;
 }
 
-/* The home marker pulses gently so it's distinguishable from the active pin. */
-@keyframes home-pulse {
-  0%,
-  100% {
-    opacity: 0.55;
-    transform: scale(1);
-  }
-  50% {
-    opacity: 0.15;
-    transform: scale(1.6);
-  }
-}
-
-.home-pulse {
-  animation: home-pulse 2.8s ease-in-out infinite;
-  transform-origin: center;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .home-pulse {
-    animation: none;
-  }
-}
-
 /* Hide the number-input spinners in the coordinate readout. */
 input[type="number"]::-webkit-inner-spin-button,
 input[type="number"]::-webkit-outer-spin-button {

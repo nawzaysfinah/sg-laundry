@@ -1,11 +1,18 @@
 /**
  * Persistence layer (Upstash Redis over REST).
  *
- * Single-user app, so the data model is deliberately tiny — two keys, no
- * per-user namespacing:
+ * Multi-user Telegram bot: every Telegram chat that registers a location gets
+ * its own entry, keyed by chat id (as a string), in one hash per concern —
+ * mirroring the pattern already used for Web Push subscriptions below.
  *
- *   laundry:home  → JSON string   { lat, lon, label, updatedAt }
- *   laundry:subs  → Redis hash    subKey → JSON StoredSubscription
+ *   laundry:tg:homes           hash   chatId → JSON HomeLocation
+ *                               (this hash IS the registry of active users —
+ *                               "registered" means "has a home entry")
+ *   laundry:tg:lastRainAlertAt hash   chatId → ISO timestamp (per-user cooldown)
+ *   laundry:tg:lastReportDate  hash   chatId → "YYYY-MM-DD" (per-user, once/day)
+ *   laundry:tg:mutedUntil      hash   chatId → ISO timestamp (per-user /mute)
+ *   laundry:subs               hash   subKey → JSON StoredSubscription
+ *                               (Web Push — dormant, browser-based, no chat id)
  *
  * Upstash's REST client is used (rather than a TCP Redis client) specifically
  * because serverless functions have no stable connection lifecycle — each
@@ -17,13 +24,16 @@ import { createHash } from "node:crypto";
 import { Redis } from "@upstash/redis";
 import type { Coords } from "./geo";
 
-const HOME_KEY = "laundry:home";
 const SUBS_KEY = "laundry:subs";
-// Telegram delivery bookkeeping (single recipient, so plain string keys — no
-// per-subscription hash needed like Web Push has).
-const TG_RAIN_ALERT_KEY = "laundry:tg:lastRainAlertAt"; // ISO timestamp
-const TG_REPORT_DATE_KEY = "laundry:tg:lastReportDate"; // "YYYY-MM-DD" (SG date)
-const TG_MUTED_UNTIL_KEY = "laundry:tg:mutedUntil"; // ISO timestamp, set by /mute
+const TG_HOMES_KEY = "laundry:tg:homes";
+// Renamed (rainAlerts/reportDates/muted, not the old singular-era names) to
+// avoid colliding with the old single-user schema's plain STRING keys of
+// almost the same name (laundry:tg:lastRainAlertAt etc.) — HSET/HGET/HDEL on
+// a key that already holds a string throws WRONGTYPE, so these must be new
+// key names, not just a type change under the old ones.
+const TG_RAIN_ALERT_KEY = "laundry:tg:rainAlerts";
+const TG_REPORT_DATE_KEY = "laundry:tg:reportDates";
+const TG_MUTED_UNTIL_KEY = "laundry:tg:muted";
 
 export type HomeLocation = Coords & {
   label?: string;
@@ -61,7 +71,7 @@ export function isStoreConfigured(): boolean {
 }
 
 /**
- * Stable short key for a subscription, derived from its endpoint URL.
+ * Stable short key for a Web Push subscription, derived from its endpoint URL.
  * Hashing rather than storing the raw endpoint as a field name keeps the key
  * space bounded and avoids putting a long push-service URL in log output.
  */
@@ -69,20 +79,32 @@ export function subscriptionKey(endpoint: string): string {
   return createHash("sha256").update(endpoint).digest("hex").slice(0, 24);
 }
 
-// ---------------------------------------------------------------------------
-// Home location
-// ---------------------------------------------------------------------------
-
-export async function getHome(): Promise<HomeLocation | null> {
-  const redis = getRedis();
-  if (!redis) return null;
-  // Upstash auto-deserialises JSON values, so this may already be an object.
-  const raw = await redis.get<HomeLocation | string>(HOME_KEY);
-  if (!raw) return null;
-  return typeof raw === "string" ? (JSON.parse(raw) as HomeLocation) : raw;
+/** Small helper: parse a hash field that Upstash may already have deserialised. */
+function parseJsonField<T>(raw: unknown): T | null {
+  if (raw === null || raw === undefined) return null;
+  try {
+    return typeof raw === "string" ? (JSON.parse(raw) as T) : (raw as T);
+  } catch {
+    return null;
+  }
 }
 
-export async function setHome(coords: Coords, label?: string): Promise<HomeLocation> {
+// ---------------------------------------------------------------------------
+// Per-user home locations (Telegram)
+// ---------------------------------------------------------------------------
+
+export async function getUserHome(chatId: string): Promise<HomeLocation | null> {
+  const redis = getRedis();
+  if (!redis) return null;
+  const raw = await redis.hget<HomeLocation | string>(TG_HOMES_KEY, chatId);
+  return parseJsonField<HomeLocation>(raw);
+}
+
+export async function setUserHome(
+  chatId: string,
+  coords: Coords,
+  label?: string
+): Promise<HomeLocation> {
   const redis = getRedis();
   if (!redis) throw new Error("Redis is not configured");
 
@@ -91,18 +113,40 @@ export async function setHome(coords: Coords, label?: string): Promise<HomeLocat
     ...(label ? { label } : {}),
     updatedAt: new Date().toISOString(),
   };
-  await redis.set(HOME_KEY, JSON.stringify(home));
+  await redis.hset(TG_HOMES_KEY, { [chatId]: JSON.stringify(home) });
   return home;
 }
 
-export async function clearHome(): Promise<void> {
+/** Every registered user's home, keyed by chat id — used by the cron checker. */
+export async function getAllUserHomes(): Promise<Record<string, HomeLocation>> {
+  const redis = getRedis();
+  if (!redis) return {};
+
+  const all = await redis.hgetall<Record<string, HomeLocation | string>>(TG_HOMES_KEY);
+  if (!all) return {};
+
+  const out: Record<string, HomeLocation> = {};
+  for (const [chatId, raw] of Object.entries(all)) {
+    const home = parseJsonField<HomeLocation>(raw);
+    if (home) out[chatId] = home; // a corrupt entry shouldn't take down the loop
+  }
+  return out;
+}
+
+/** Wipes every trace of a chat — used by /stop. */
+export async function deleteUserData(chatId: string): Promise<void> {
   const redis = getRedis();
   if (!redis) return;
-  await redis.del(HOME_KEY);
+  await Promise.all([
+    redis.hdel(TG_HOMES_KEY, chatId),
+    redis.hdel(TG_RAIN_ALERT_KEY, chatId),
+    redis.hdel(TG_REPORT_DATE_KEY, chatId),
+    redis.hdel(TG_MUTED_UNTIL_KEY, chatId),
+  ]);
 }
 
 // ---------------------------------------------------------------------------
-// Push subscriptions
+// Push subscriptions (Web Push — dormant, unrelated to Telegram chat ids)
 // ---------------------------------------------------------------------------
 
 export async function getSubscriptions(): Promise<Record<string, StoredSubscription>> {
@@ -114,11 +158,8 @@ export async function getSubscriptions(): Promise<Record<string, StoredSubscript
 
   const out: Record<string, StoredSubscription> = {};
   for (const [key, value] of Object.entries(all)) {
-    try {
-      out[key] = typeof value === "string" ? (JSON.parse(value) as StoredSubscription) : value;
-    } catch {
-      // A corrupt entry shouldn't take down the whole checker — drop it.
-    }
+    const parsed = parseJsonField<StoredSubscription>(value);
+    if (parsed) out[key] = parsed;
   }
   return out;
 }
@@ -148,12 +189,7 @@ export async function getSubscription(key: string): Promise<StoredSubscription |
   const redis = getRedis();
   if (!redis) return null;
   const raw = await redis.hget<StoredSubscription | string>(SUBS_KEY, key);
-  if (!raw) return null;
-  try {
-    return typeof raw === "string" ? (JSON.parse(raw) as StoredSubscription) : raw;
-  } catch {
-    return null;
-  }
+  return parseJsonField<StoredSubscription>(raw);
 }
 
 export async function deleteSubscription(key: string): Promise<void> {
@@ -173,49 +209,51 @@ export async function markNotified(key: string, at: Date = new Date()): Promise<
 }
 
 // ---------------------------------------------------------------------------
-// Telegram delivery state
+// Per-user Telegram delivery state
 // ---------------------------------------------------------------------------
 
-/** ISO timestamp of the last Telegram rain alert, for the cooldown. */
-export async function getLastRainAlertAt(): Promise<Date | null> {
+/** ISO timestamp of this chat's last Telegram rain alert, for its cooldown. */
+export async function getUserLastRainAlertAt(chatId: string): Promise<Date | null> {
   const redis = getRedis();
   if (!redis) return null;
-  const raw = await redis.get<string>(TG_RAIN_ALERT_KEY);
+  const raw = await redis.hget<string>(TG_RAIN_ALERT_KEY, chatId);
   return raw ? new Date(raw) : null;
 }
 
-export async function setLastRainAlertAt(at: Date = new Date()): Promise<void> {
+export async function setUserLastRainAlertAt(
+  chatId: string,
+  at: Date = new Date()
+): Promise<void> {
   const redis = getRedis();
   if (!redis) return;
-  await redis.set(TG_RAIN_ALERT_KEY, at.toISOString());
+  await redis.hset(TG_RAIN_ALERT_KEY, { [chatId]: at.toISOString() });
 }
 
-/** SG calendar date ("YYYY-MM-DD") the morning report last went out. */
-export async function getLastReportDate(): Promise<string | null> {
+/** SG calendar date ("YYYY-MM-DD") this chat's morning report last went out. */
+export async function getUserLastReportDate(chatId: string): Promise<string | null> {
   const redis = getRedis();
   if (!redis) return null;
-  return (await redis.get<string>(TG_REPORT_DATE_KEY)) ?? null;
+  return (await redis.hget<string>(TG_REPORT_DATE_KEY, chatId)) ?? null;
 }
 
-export async function setLastReportDate(date: string): Promise<void> {
+export async function setUserLastReportDate(chatId: string, date: string): Promise<void> {
   const redis = getRedis();
   if (!redis) return;
-  await redis.set(TG_REPORT_DATE_KEY, date);
+  await redis.hset(TG_REPORT_DATE_KEY, { [chatId]: date });
 }
 
-/** Set by the /mute command; rain alerts stay quiet until this time passes. */
-export async function getMutedUntil(): Promise<Date | null> {
+/** Set by /mute; this chat's rain alerts stay quiet until this time passes. */
+export async function getUserMutedUntil(chatId: string): Promise<Date | null> {
   const redis = getRedis();
   if (!redis) return null;
-  const raw = await redis.get<string>(TG_MUTED_UNTIL_KEY);
+  const raw = await redis.hget<string>(TG_MUTED_UNTIL_KEY, chatId);
   return raw ? new Date(raw) : null;
 }
 
-export async function setMutedUntil(until: Date): Promise<void> {
+export async function setUserMutedUntil(chatId: string, until: Date): Promise<void> {
   const redis = getRedis();
   if (!redis) return;
-  // TTL the key to the mute duration (+ a small buffer) so a stale timestamp
-  // can never linger in Redis after it's no longer relevant.
-  const ttlSeconds = Math.max(1, Math.ceil((until.getTime() - Date.now()) / 1000) + 60);
-  await redis.set(TG_MUTED_UNTIL_KEY, until.toISOString(), { ex: ttlSeconds });
+  // Hash fields can't carry a per-field TTL, unlike a top-level key — a stale
+  // past timestamp is harmless though, since callers just compare it to "now".
+  await redis.hset(TG_MUTED_UNTIL_KEY, { [chatId]: until.toISOString() });
 }
