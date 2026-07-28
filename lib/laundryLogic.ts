@@ -118,10 +118,22 @@ export const LAUNDRY_CONFIG = {
     /** Don't push again within this many minutes, even if it still qualifies. */
     cooldownMinutes: 90,
     /**
-     * Quiet hours: only notify between these SG hours (inclusive start,
-     * exclusive end). Set `enabled: false` to be woken at 3am.
+     * Quiet hours: only send *rain alerts* between these SG hours (inclusive
+     * start, exclusive end). Set `enabled: false` to be woken at 3am. Does not
+     * apply to the morning report, which has its own time (below).
      */
     quietHours: { enabled: true, startHour: 7, endHour: 21 },
+
+    /**
+     * Daily morning laundry report (Telegram).
+     *
+     * The report fires on the first checker run at or after `reportHour` SGT,
+     * but only within a `reportWindowHours` catch-up window — so if the
+     * scheduler was down all morning and first runs at 2pm, it skips today's
+     * report rather than sending a stale "good morning" in the afternoon.
+     * Sent exactly once per calendar day (tracked in Redis).
+     */
+    report: { enabled: true, reportHour: 8, reportWindowHours: 4 },
   },
 } as const;
 

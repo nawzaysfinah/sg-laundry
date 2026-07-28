@@ -19,6 +19,10 @@ import type { Coords } from "./geo";
 
 const HOME_KEY = "laundry:home";
 const SUBS_KEY = "laundry:subs";
+// Telegram delivery bookkeeping (single recipient, so plain string keys — no
+// per-subscription hash needed like Web Push has).
+const TG_RAIN_ALERT_KEY = "laundry:tg:lastRainAlertAt"; // ISO timestamp
+const TG_REPORT_DATE_KEY = "laundry:tg:lastReportDate"; // "YYYY-MM-DD" (SG date)
 
 export type HomeLocation = Coords & {
   label?: string;
@@ -165,4 +169,35 @@ export async function markNotified(key: string, at: Date = new Date()): Promise<
   await redis.hset(SUBS_KEY, {
     [key]: JSON.stringify({ ...existing, lastNotifiedAt: at.toISOString() }),
   });
+}
+
+// ---------------------------------------------------------------------------
+// Telegram delivery state
+// ---------------------------------------------------------------------------
+
+/** ISO timestamp of the last Telegram rain alert, for the cooldown. */
+export async function getLastRainAlertAt(): Promise<Date | null> {
+  const redis = getRedis();
+  if (!redis) return null;
+  const raw = await redis.get<string>(TG_RAIN_ALERT_KEY);
+  return raw ? new Date(raw) : null;
+}
+
+export async function setLastRainAlertAt(at: Date = new Date()): Promise<void> {
+  const redis = getRedis();
+  if (!redis) return;
+  await redis.set(TG_RAIN_ALERT_KEY, at.toISOString());
+}
+
+/** SG calendar date ("YYYY-MM-DD") the morning report last went out. */
+export async function getLastReportDate(): Promise<string | null> {
+  const redis = getRedis();
+  if (!redis) return null;
+  return (await redis.get<string>(TG_REPORT_DATE_KEY)) ?? null;
+}
+
+export async function setLastReportDate(date: string): Promise<void> {
+  const redis = getRedis();
+  if (!redis) return;
+  await redis.set(TG_REPORT_DATE_KEY, date);
 }

@@ -1,12 +1,13 @@
 # 🌧️ SG Laundry — Singapore Rain & Laundry Advisor
 
 Drop a pin anywhere in Singapore to see current & upcoming rain, a transparent
-laundry-drying recommendation, and (optionally) get a push notification when
-rain is heading for your home.
+laundry-drying recommendation, and — via Telegram — a rain-incoming alert and a
+daily morning digest telling you whether it's a good day to hang laundry.
 
 Built to run at **$0/month**: Next.js on Vercel Hobby, Open-Meteo for weather
 (no key), CARTO map tiles (no key), a Windy embed for the visual radar, Upstash
-Redis free tier for the tiny bit of state, and Web Push for alerts.
+Redis free tier for the tiny bit of state, and a Telegram bot for alerts (Web
+Push is also in the codebase as a dormant fallback channel — see below).
 
 No accounts. No analytics. No trackers. One user — you.
 
@@ -21,7 +22,9 @@ No accounts. No analytics. No trackers. One user — you.
 | **Current conditions** | Temp, humidity, wind, cloud, UV in plain language | Open-Meteo `current` + `hourly` |
 | **Rain timeline** | Colour-coded rain-probability bars for the next 12 hours | Open-Meteo `hourly` |
 | **Live rain radar** | Windy radar loop, centred on the pin (**visual only**) | Windy embed |
-| **Home & notifications** | Save a home pin, toggle rain alerts | Upstash Redis + Web Push |
+| **Home & notifications** | Save a home pin, toggle browser rain alerts (Telegram runs automatically once configured — no in-app toggle needed) | Upstash Redis + Web Push |
+| **Telegram — rain alert** | Sent automatically when rain is imminent near home | Cron checker → `lib/telegram.ts` |
+| **Telegram — morning report** | One digest per day (~8am SGT by default): verdict, best window, peak rain | Cron checker → `lib/report.ts` |
 
 > The Windy iframe is a **picture**, not a data source. Every number, threshold
 > and recommendation comes from Open-Meteo. See `components/WindyRadar.tsx`.
@@ -39,9 +42,11 @@ app/
     weather/route.ts           GET  proxy → Open-Meteo forecast (built view-model)
     geocode/route.ts           GET  proxy → Open-Meteo geocoding (SG only)
     home/route.ts              GET/POST/DELETE home location
-    subscribe/route.ts         POST/DELETE push subscription
-    push/public-key/route.ts   GET  VAPID public key
-    cron/check-rain/route.ts   GET/POST protected rain checker (external cron)
+    subscribe/route.ts         POST/DELETE push subscription (Web Push, dormant)
+    push/public-key/route.ts   GET  VAPID public key (Web Push, dormant)
+    cron/check-rain/route.ts   GET/POST protected checker — drives Telegram
+                                rain alerts, the daily Telegram report, AND the
+                                dormant Web Push channel, all from one call
 lib/
   laundryLogic.ts   ← the tunable model. All constants live in LAUNDRY_CONFIG.
   forecast.ts          joins Open-Meteo data to the model → the UI view-model
@@ -49,8 +54,10 @@ lib/
   geo.ts               Singapore bounding box + coordinate validation
   sgTime.ts            Asia/Singapore time handling (naive-timestamp safe)
   store.ts             Upstash Redis persistence
-  push.ts              web-push sending (server)
-  pushClient.ts        browser subscribe/unsubscribe flow
+  telegram.ts          Telegram Bot API client (primary notification channel)
+  report.ts            pure message builders — rain alert + morning digest text
+  push.ts              web-push sending (server, dormant fallback channel)
+  pushClient.ts        browser subscribe/unsubscribe flow (dormant)
 components/            map, panels, search, settings, icons
 public/
   sw.js                service worker (push delivery only — no offline caching)
@@ -75,15 +82,18 @@ npm run dev
 
 Open <http://localhost:3000>. The map, forecast, laundry advisor, timeline and
 radar all work **with no configuration at all** — Open-Meteo and CARTO need no
-keys. Only the *home location* and *push notifications* need the env vars below;
-until you set them the settings panel shows a friendly "not configured" note.
+keys. Only the *home location* and *notifications* (Telegram or Web Push) need
+the env vars below; until you set them the settings panel shows a friendly "not
+configured" note, and the cron route reports each gate it's blocked on.
 
 ---
 
 ## Deploy to Vercel + enable notifications
 
-This is a one-time setup. Steps 1–4 configure services; step 5 deploys; step 6
-wires up the external scheduler that actually sends the alerts.
+This is a one-time setup: steps 1–4 configure services (Upstash, Telegram,
+a cron secret, and optionally Web Push), step 5 sets the env vars and deploys,
+step 6 wires up the external scheduler that actually sends alerts and the
+daily report, and step 7 sets your home location.
 
 ### 1. Create a free Upstash Redis database
 
@@ -94,15 +104,20 @@ wires up the external scheduler that actually sends the alerts.
    - `UPSTASH_REDIS_REST_URL`
    - `UPSTASH_REDIS_REST_TOKEN`
 
-### 2. Generate VAPID keys (for Web Push)
+### 2. Create a Telegram bot and get your chat ID
 
-```bash
-npx web-push generate-vapid-keys
-```
+This is the primary notification channel — no APNs/VAPID complexity, no
+PWA-install requirement, works identically on phone/desktop.
 
-This prints a **Public Key** and **Private Key**. You'll set them as
-`VAPID_PUBLIC_KEY` and `VAPID_PRIVATE_KEY`. `VAPID_SUBJECT` is just a contact
-URL — your own email as `mailto:you@example.com` is fine.
+1. In Telegram, message **[@BotFather](https://t.me/BotFather)** → `/newbot` →
+   follow the prompts (any name/username). It replies with a token that looks
+   like `123456789:AAH...xyz` — that's `TELEGRAM_BOT_TOKEN`.
+2. Message **your new bot** anything (e.g. "hi") — Telegram bots can't message
+   you until you've messaged them first.
+3. Get your numeric chat ID. Easiest way: message **[@userinfobot](https://t.me/userinfobot)**
+   — it replies with your `Id`. That's `TELEGRAM_CHAT_ID`.
+   (Alternative: open `https://api.telegram.org/bot<TOKEN>/getUpdates` in a
+   browser after step 2 and read `message.chat.id` from the JSON.)
 
 ### 3. Generate a cron secret
 
@@ -110,24 +125,41 @@ URL — your own email as `mailto:you@example.com` is fine.
 openssl rand -hex 32
 ```
 
-Use the output as `CRON_SECRET`.
+Use the output as `CRON_SECRET`. This is a password you invent, not something
+to look up — it's how the scheduler proves it's allowed to trigger the checker.
 
-### 4. Set the environment variables
+### 4. (Optional) Generate VAPID keys for the dormant Web Push channel
 
-Copy `.env.example` to `.env.local` for local testing, and add the **same** keys
-in Vercel under **Project → Settings → Environment Variables** (Production +
-Preview). Full list:
+Skip this if you're happy with Telegram-only — the app works fully without it.
+Only do this if you also want browser push notifications:
+
+```bash
+npx web-push generate-vapid-keys
+```
+
+Prints a **Public Key** and **Private Key** → `VAPID_PUBLIC_KEY` /
+`VAPID_PRIVATE_KEY`. `VAPID_SUBJECT` is just a contact URL, e.g.
+`mailto:you@example.com`.
+
+### 5. Set the environment variables and deploy
+
+Copy `.env.example` to `.env.local` for local testing, and add the same keys in
+Vercel under **Project → Settings → Environment Variables** (Production +
+Preview):
 
 ```
 UPSTASH_REDIS_REST_URL
 UPSTASH_REDIS_REST_TOKEN
+TELEGRAM_BOT_TOKEN
+TELEGRAM_CHAT_ID
+CRON_SECRET
+# Optional — only if you did step 4:
 VAPID_PUBLIC_KEY
 VAPID_PRIVATE_KEY
-VAPID_SUBJECT           # e.g. mailto:you@example.com
-CRON_SECRET
+VAPID_SUBJECT
 ```
 
-### 5. Deploy
+Then deploy:
 
 ```bash
 npm i -g vercel      # if you don't have the CLI
@@ -135,26 +167,19 @@ vercel               # first run: link/create the project (preview deploy)
 vercel --prod        # promote to production
 ```
 
-(Or push the repo to GitHub and "Import Project" in the Vercel dashboard —
-either way, make sure the six env vars are set before the first production
-build.)
+(Or push to GitHub and "Import Project" in the Vercel dashboard — either way,
+set the env vars before the first production build.)
 
-After deploying, open the site on your phone, drop a pin on your home, tap
-**"Set this pin as my home"**, then flip on **Rain alerts** and accept the
-browser permission prompt.
-
-> **iOS note:** Safari only allows Web Push for **installed** web apps. On your
-> iPhone, open the site in Safari → Share → **Add to Home Screen**, launch it
-> from the new icon, *then* enable alerts. The app detects this and tells you if
-> you try to enable alerts from a normal Safari tab. Android/desktop Chrome work
-> without installing.
-
-### 6. Register the external scheduler (this is what sends the alerts)
+### 6. Register the external scheduler (this is what actually sends things)
 
 **Why this is needed:** Vercel Hobby (free) cron jobs only run **once per day**
 and aren't time-precise — a sub-daily entry in `vercel.json` is rejected at
-deploy time. Rain warnings are useless at that cadence, so the checker is a
-normal protected route driven by a free external scheduler every 15–30 minutes.
+deploy time. Rain warnings and a timely morning report are useless at that
+cadence, so the checker is a normal protected route driven by a free external
+scheduler every 15–30 minutes. Every run does three things in one call: sends
+a Telegram rain alert if warranted, sends the once-daily Telegram morning
+report if it's the right time and not sent yet, and checks the (empty, unless
+you set up VAPID) Web Push channel.
 
 #### Option A — cron-job.org (easiest)
 
@@ -184,17 +209,48 @@ a 15-minute schedule. To use it:
 
 #### Verify it's wired up
 
-`?dry=1` runs the whole check and reports what *would* be sent, without sending
-anything or touching the cooldown:
+Two quick checks, both secret-protected:
 
 ```bash
+# 1. Confirm the bot itself works — sends a real "✅ wired up correctly" message.
+curl -s "https://YOUR-APP.vercel.app/api/cron/check-rain?test=telegram" \
+  -H "Authorization: Bearer YOUR_CRON_SECRET"
+
+# 2. Dry-run the full checker — reports what WOULD send, sends nothing.
 curl -s "https://YOUR-APP.vercel.app/api/cron/check-rain?dry=1" \
   -H "Authorization: Bearer YOUR_CRON_SECRET" | jq
 ```
 
-You should get JSON like `{"checked":true,"notified":false,"peakProb":18,...}`
-(or `{"checked":false,"reason":"no-home-location"}` until you've saved a home
-and subscribed). A `401` means the secret/header don't match.
+The dry-run gives you a breakdown per channel, e.g.:
+
+```json
+{
+  "checked": true,
+  "sgTime": "2026-07-28T08:05",
+  "report": "would-send",
+  "rainAlert": { "status": "below-threshold", "peakProb": 12, "threshold": 40 },
+  "push": "no-subscriptions"
+}
+```
+
+`report`/`rainAlert` will read `"telegram-not-configured"` until step 2 is done,
+and everything reads `{"checked":false,"reason":"no-home-location"}` until you've
+saved a home (step 7 below). A `401` overall means the `CRON_SECRET` doesn't
+match.
+
+### 7. Set your home location
+
+Open the deployed site, drop the pin on your home, and tap **"Set this pin as
+my home"** in the Home & Notifications panel. That's the point the checker
+watches — no browser permission prompt needed, since Telegram doesn't require
+one. (The **Rain alerts** toggle in that panel is for the dormant Web Push
+channel only; leave it off if you're running Telegram-only.)
+
+> **If you also enabled Web Push (step 4):** on iOS, Safari only allows push
+> for **installed** web apps — Share → **Add to Home Screen**, launch from the
+> icon, then enable the toggle. The app detects and explains this if you try
+> from a normal Safari tab. Not needed for Telegram, which has no such
+> restriction.
 
 ---
 
@@ -212,7 +268,10 @@ Open `lib/laundryLogic.ts`. Everything lives in `LAUNDRY_CONFIG`:
   cut-off that disqualifies a window, and `lengthBonusPerHour` (which stops the
   search from always picking the shortest possible block — see the comment).
 - **`notification`** — alert threshold (default 40%), look-ahead hours, cooldown
-  (default 90 min), and quiet hours (default 7am–9pm).
+  (default 90 min), and quiet hours (default 7am–9pm, applies to rain alerts
+  only). **`notification.report`** — the morning digest: `reportHour` (default
+  8am SGT) and `reportWindowHours` (default 4h catch-up window before it gives
+  up on today and waits for tomorrow).
 
 No rebuild is needed for the constants to take effect beyond the normal
 Next.js hot reload in dev / redeploy in prod.
@@ -229,8 +288,12 @@ Next.js hot reload in dev / redeploy in prod.
 - **Privacy.** Your coordinates only ever go to your own Vercel functions, which
   proxy Open-Meteo — your device's IP is never handed to the weather API
   alongside your home location. Coordinates are rounded to ~11m before storage.
-  No analytics or third-party scripts run, beyond the map tiles and the Windy
-  radar iframe (sandboxed, `no-referrer`).
+  No analytics or third-party scripts run, beyond the map tiles, the Windy
+  radar iframe (sandboxed, `no-referrer`), and the outbound-only Telegram Bot
+  API call the cron route makes to deliver alerts.
+- **Telegram bot scope.** The bot never reads messages or handles commands —
+  `lib/telegram.ts` only ever calls `sendMessage`. There's no webhook and no
+  polling loop, so it has no way to receive anything from you or anyone else.
 - **No auth.** This is a single-user tool with one home pin. If you want to lock
   it down, enable Vercel's built-in **Deployment Protection / password** on the
   project — the app needs no code changes for that.
