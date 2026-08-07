@@ -25,11 +25,11 @@
 
 import { NextResponse } from "next/server";
 import { buildForecastView, type ForecastView } from "@/lib/forecast";
-import { LAUNDRY_CONFIG } from "@/lib/laundryLogic";
+import { LAUNDRY_CONFIG, type ReportSlot } from "@/lib/laundryLogic";
 import { isPushConfigured } from "@/lib/push";
-import { buildMorningReport, buildRainAlert } from "@/lib/report";
+import { buildDailyReport, buildRainAlert } from "@/lib/report";
 import { secretMatches } from "@/lib/security";
-import { sgNow, type SgNow } from "@/lib/sgTime";
+import { isWeekday, sgNow, type SgNow } from "@/lib/sgTime";
 import {
   getAllUserHomes,
   getSubscriptions,
@@ -78,35 +78,54 @@ function peakLookaheadProb(view: ForecastView, lookaheadHours: number): number {
 }
 
 // ---------------------------------------------------------------------------
-// 1. Morning report — once per day per chat, its own time window, ignores
-//    quiet hours (a digest arriving at 8am isn't the kind of thing quiet
-//    hours exist to prevent).
+// 1. Report slots — each fires at most once per day per chat, in its own time
+//    window, independent of the others (sending "morning" doesn't block
+//    "evening" the same day). Slots ignore quiet hours — a digest arriving at
+//    its own configured time isn't the kind of thing quiet hours exist to
+//    prevent.
 // ---------------------------------------------------------------------------
-async function maybeSendReport(
+async function maybeSendReportSlot(
+  slot: ReportSlot,
   view: ForecastView,
   home: HomeLocation,
   chatId: string,
   now: SgNow,
   dryRun: boolean
 ): Promise<unknown> {
-  const r = LAUNDRY_CONFIG.notification.report;
-  if (!r.enabled) return "disabled";
+  if (slot.weekdaysOnly && !isWeekday(now.date)) return "not-a-weekday";
 
-  // Only inside the morning catch-up window, so a scheduler that was down all
-  // morning doesn't fire a "good morning" digest in the afternoon.
-  if (now.hour < r.reportHour || now.hour >= r.reportHour + r.reportWindowHours) {
-    return { status: "outside-window", reportHour: r.reportHour, windowHours: r.reportWindowHours };
+  // Only inside the slot's catch-up window, so a scheduler that was down for
+  // a while doesn't fire a stale digest hours late.
+  if (now.hour < slot.hour || now.hour >= slot.hour + slot.windowHours) {
+    return { status: "outside-window", hour: slot.hour, windowHours: slot.windowHours };
   }
 
-  if ((await getUserLastReportDate(chatId)) === now.date) return "already-sent-today";
+  if ((await getUserLastReportDate(chatId, slot.name)) === now.date) return "already-sent-today";
   if (dryRun) return "would-send";
 
-  const res = await sendTelegram(chatId, buildMorningReport(view, home, now.date));
+  const res = await sendTelegram(chatId, buildDailyReport(view, home, now.date));
   if (res.ok) {
-    await setUserLastReportDate(chatId, now.date);
+    await setUserLastReportDate(chatId, slot.name, now.date);
     return "sent";
   }
   return { status: "failed", error: res.error };
+}
+
+/** Runs every configured slot for one chat and packages the per-slot results. */
+async function maybeSendReport(
+  view: ForecastView,
+  home: HomeLocation,
+  chatId: string,
+  now: SgNow,
+  dryRun: boolean
+): Promise<Record<string, unknown>> {
+  const r = LAUNDRY_CONFIG.notification.report;
+  if (!r.enabled) return { disabled: true };
+
+  const entries = await Promise.all(
+    r.slots.map(async (slot) => [slot.name, await maybeSendReportSlot(slot, view, home, chatId, now, dryRun)] as const)
+  );
+  return Object.fromEntries(entries);
 }
 
 // ---------------------------------------------------------------------------

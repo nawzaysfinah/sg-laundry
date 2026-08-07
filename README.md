@@ -26,8 +26,8 @@ of everyone else's.
 | **Rain timeline** | Colour-coded rain-probability bars for the next 12 hours | Open-Meteo `hourly` |
 | **Live rain radar** | Windy radar loop, centred on the pin (**visual only**) | Windy embed |
 | **Telegram — onboarding** | Share a Telegram Location to register it; `/setlocation` any time to change it, `/stop` to delete your data | Webhook → `app/api/telegram/webhook/route.ts` |
-| **Telegram — rain alert** | Sent automatically to each registered chat when rain is imminent near *their* location | Cron checker → `lib/telegram.ts` |
-| **Telegram — morning report** | One digest per day per chat (~8am SGT by default): verdict, best window, peak rain | Cron checker → `lib/report.ts` |
+| **Telegram — rain alert** | Sent when rain probability crosses 90% within 2h near a chat's location — deliberately high, see the tuning section | Cron checker → `lib/telegram.ts` |
+| **Telegram — daily report** | A compact, emoji-led **3-day outlook** per chat, sent at 8am daily and again ~6pm on weekdays | Cron checker → `lib/report.ts` |
 | **Telegram — commands** | `/now` `/report` `/window` `/home` `/mute` `/help` — ask on demand instead of waiting | Webhook → `app/api/telegram/webhook/route.ts` |
 
 > The Windy iframe is a **picture**, not a data source. Every number, threshold
@@ -49,8 +49,8 @@ app/
     push/public-key/route.ts   GET  VAPID public key (Web Push, dormant)
     cron/check-rain/route.ts   GET/POST protected checker — loops over every
                                 registered Telegram chat, sending each its own
-                                rain alert / morning report; also touches the
-                                dormant Web Push channel, all from one call
+                                rain alert / daily report slots; also touches
+                                the dormant Web Push channel, all from one call
     telegram/webhook/route.ts  POST Telegram command + location handler
                                 (/setlocation, /now, /report, /window, /home,
                                 /mute, /stop, /help) — the only inbound route;
@@ -190,12 +190,13 @@ set the env vars before the first production build.)
 
 **Why this is needed:** Vercel Hobby (free) cron jobs only run **once per day**
 and aren't time-precise — a sub-daily entry in `vercel.json` is rejected at
-deploy time. Rain warnings and a timely morning report are useless at that
+deploy time. Rain warnings and a timely daily report are useless at that
 cadence, so the checker is a normal protected route driven by a free external
 scheduler every 15–30 minutes. Every run loops over every chat that has
 registered a location and, for each one independently: sends a rain alert if
-warranted, sends the once-daily morning report if it's the right time and not
-sent yet; it also checks the (empty, unless you set up VAPID) Web Push channel
+warranted, and sends any report slot that's due and not yet sent today (see
+`LAUNDRY_CONFIG.notification.report.slots` — 8am daily, ~6pm on weekdays, by
+default); it also checks the (empty, unless you set up VAPID) Web Push channel
 once.
 
 #### Option A — cron-job.org (easiest)
@@ -268,8 +269,8 @@ get a breakdown per registered chat, e.g.:
     {
       "chatId": "987654321",
       "home": { "lat": 1.3521, "lon": 103.8198 },
-      "report": "would-send",
-      "rainAlert": { "status": "below-threshold", "peakProb": 12, "threshold": 40 }
+      "report": { "morning": "would-send", "evening": "outside-window" },
+      "rainAlert": { "status": "below-threshold", "peakProb": 55, "threshold": 90 }
     }
   ],
   "push": "no-subscriptions"
@@ -337,13 +338,18 @@ Open `lib/laundryLogic.ts`. Everything lives in `LAUNDRY_CONFIG`:
 - **`bestWindow`** — daylight hours scanned, minimum block length, the rain
   cut-off that disqualifies a window, and `lengthBonusPerHour` (which stops the
   search from always picking the shortest possible block — see the comment).
-- **`notification`** — alert threshold (default 40%), look-ahead hours, cooldown
-  (default 90 min), and quiet hours (default 7am–9pm, applies to rain alerts
-  only). **`notification.report`** — the morning digest: `reportHour` (default
-  8am SGT) and `reportWindowHours` (default 4h catch-up window before it gives
-  up on today and waits for tomorrow). **`notification.muteDurationMinutes`**
-  (default 120) — how long `/mute` in Telegram pauses rain alerts for; the
-  morning report is unaffected by mute.
+- **`notification`** — alert threshold (default **90%** — deliberately high;
+  see the comment in the config for why a lower bar just trains you to ignore
+  the alert in SG's climate), look-ahead hours, cooldown (default 90 min), and
+  quiet hours (default 7am–9pm, applies to rain alerts only).
+  **`notification.report.slots`** — an array of named report times, each with
+  an `hour`, a `windowHours` catch-up window, and `weekdaysOnly`. Defaults to
+  `morning` (8am, every day) and `evening` (6pm, weekdays only). Add, remove,
+  or retime slots freely — the cron checker loops over whatever's here with no
+  other code changes needed, and tracks each slot's "already sent today" state
+  independently per chat. **`notification.muteDurationMinutes`** (default 120)
+  — how long `/mute` in Telegram pauses rain alerts for; report slots are
+  unaffected by mute.
 
 No rebuild is needed for the constants to take effect beyond the normal
 Next.js hot reload in dev / redeploy in prod.

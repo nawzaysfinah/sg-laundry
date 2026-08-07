@@ -9,7 +9,7 @@
 import type { ForecastView } from "./forecast";
 import type { RecommendationLevel } from "./laundryLogic";
 import { formatDryHours } from "./laundryLogic";
-import { SG_TIMEZONE, formatHourShort } from "./sgTime";
+import { dayLabel, formatDateLabel } from "./sgTime";
 import type { HomeLocation } from "./store";
 import { escapeHtml } from "./telegram";
 
@@ -20,62 +20,44 @@ const LEVEL_EMOJI: Record<RecommendationLevel, string> = {
   "bring-in": "🌧️",
 };
 
-/** "Sat 25 Jul" from an SG date string "2026-07-25". */
-function formatDateLabel(sgDate: string): string {
-  // Anchor at local noon so formatting can never slip to an adjacent day.
-  const d = new Date(`${sgDate}T12:00:00+08:00`);
-  return new Intl.DateTimeFormat("en-GB", {
-    timeZone: SG_TIMEZONE,
-    weekday: "short",
-    day: "numeric",
-    month: "short",
-  }).format(d);
-}
-
 function homeName(home: HomeLocation): string {
   return escapeHtml(home.label?.trim() || "home");
 }
 
-/** Peak rain hour across the forecast timeline (≈ the rest of the laundry day). */
-function peakRain(view: ForecastView): { prob: number; when: string } | null {
-  if (view.timeline.length === 0) return null;
-  let best = view.timeline[0];
-  for (const h of view.timeline) if (h.precipProbPct > best.precipProbPct) best = h;
-  return { prob: best.precipProbPct, when: formatHourShort(best.time) };
-}
-
 /**
- * The once-daily morning digest. Built to be skimmable at a glance on a phone
- * lock screen: verdict first, then the one actionable number (best window),
- * then context.
+ * The daily digest (sent at each configured report slot — see
+ * LAUNDRY_CONFIG.notification.report.slots). One compact line per day: emoji
+ * verdict, best window if there is one, peak rain chance. Deliberately terse —
+ * this is a glance at a phone lock screen, not something to read line by line;
+ * /report and /now still give the fuller single-moment detail on demand.
  */
-export function buildMorningReport(view: ForecastView, home: HomeLocation, sgDate: string): string {
-  const { current, recommendation, bestWindow, bestWindowIsTomorrow } = view;
-  const emoji = LEVEL_EMOJI[recommendation.level];
-  const peak = peakRain(view);
-
+export function buildDailyReport(view: ForecastView, home: HomeLocation, sgDate: string): string {
   const lines: string[] = [];
-  lines.push(`🧺 <b>Laundry outlook — ${escapeHtml(formatDateLabel(sgDate))}</b>`);
-  lines.push(`${homeName(home)} · ${Math.round(current.tempC)}°C, ${Math.round(current.rh)}% humidity`);
-  lines.push("");
-  lines.push(`${emoji} <b>${escapeHtml(recommendation.headline)}</b>`);
-  lines.push(escapeHtml(recommendation.detail));
+  lines.push(`🧺 <b>3-day outlook — ${homeName(home)}</b>`);
   lines.push("");
 
-  if (bestWindow) {
-    const when = bestWindowIsTomorrow ? "tomorrow" : "today";
-    lines.push(
-      `🕒 <b>Best window ${when}:</b> ${escapeHtml(bestWindow.label)} (${bestWindow.hours}h, avg score ${bestWindow.averageScore})`
-    );
-  } else {
-    lines.push("🕒 <b>No good drying window</b> in today's forecast.");
+  for (const day of view.outlook) {
+    const emoji = LEVEL_EMOJI[day.verdict];
+    const label = dayLabel(day.date, sgDate);
+    // "Today (Tue 28 Jul)" / "Tomorrow (Wed 29 Jul)" for the first two days;
+    // formatDateLabel(date) === label already for day 3+, so just show it once.
+    const heading =
+      label === "Today" || label === "Tomorrow"
+        ? `${label} (${escapeHtml(formatDateLabel(day.date))})`
+        : escapeHtml(label);
+
+    const verdictText = day.verdict === "great" ? "Great" : day.verdict === "ok" ? "OK" : "Poor";
+    const windowText = day.bestWindow
+      ? `window ${escapeHtml(day.bestWindow.label)}`
+      : "no good window";
+
+    lines.push(`${emoji} <b>${heading}</b> — ${verdictText} · ${windowText} · peak rain ${day.peakRainProbPct}%`);
   }
 
-  lines.push(`💧 <b>Drying time now:</b> ${escapeHtml(formatDryHours(current.dryHours))}`);
-
-  if (peak) {
-    lines.push(`🌧️ <b>Peak rain chance:</b> ${peak.prob}% around ${escapeHtml(peak.when)}`);
-  }
+  lines.push("");
+  lines.push(
+    `📍 ${homeName(home)} · now: ${Math.round(view.current.tempC)}°C, ${Math.round(view.current.rh)}% humidity`
+  );
 
   return lines.join("\n");
 }

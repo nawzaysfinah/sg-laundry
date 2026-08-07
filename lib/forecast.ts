@@ -12,11 +12,13 @@ import {
   computeDryingScore,
   estimateDryHours,
   findBestWindow,
+  getDayVerdict,
   getRecommendation,
   type BestWindow,
+  type DayVerdictLevel,
   type Recommendation,
 } from "./laundryLogic";
-import { currentHourIndex, dateOf, sgNow } from "./sgTime";
+import { addDays, currentHourIndex, dateOf, sgNow } from "./sgTime";
 import {
   describeWeather,
   fetchForecast,
@@ -27,6 +29,9 @@ import {
 
 /** How many hours of timeline the UI renders. */
 export const TIMELINE_HOURS = 12;
+
+/** How many days the Telegram report's outlook covers (today + this many - 1 more). */
+export const OUTLOOK_DAYS = 3;
 
 export type HourPoint = {
   /** Naive local timestamp, "2026-07-24T13:00" */
@@ -64,6 +69,17 @@ export type ForecastView = {
   bestWindow: BestWindow | null;
   /** True when "today" is already too late for a full window (past ~7pm). */
   bestWindowIsTomorrow: boolean;
+  /** Today plus the next OUTLOOK_DAYS-1 days, each scored independently — used by the Telegram report. */
+  outlook: DayOutlook[];
+};
+
+export type DayOutlook = {
+  /** SG date, "2026-07-28" */
+  date: string;
+  verdict: DayVerdictLevel;
+  bestWindow: BestWindow | null;
+  /** Highest rain probability anywhere in this day's hours. */
+  peakRainProbPct: number;
 };
 
 /**
@@ -154,6 +170,25 @@ export function buildForecastView(coords: Coords, raw: OpenMeteoForecast): Forec
     bestWindowIsTomorrow = bestWindow !== null;
   }
 
+  // ---- Multi-day outlook ----------------------------------------------------
+  // Each day is scored independently (unlike bestWindow above, which falls
+  // back to tomorrow when today has nothing left) — a 3-day report should show
+  // "no good window" for a genuinely washed-out day, not silently borrow a
+  // window from a different day. Today only considers hours from now on, since
+  // the past isn't actionable; future days use the whole day.
+  const outlook: DayOutlook[] = [];
+  for (let i = 0; i < OUTLOOK_DAYS; i++) {
+    const date = addDays(today, i);
+    const dayHours = allHours.filter(
+      (p) => dateOf(p.time) === date && (i > 0 || p.time >= now.hourKey)
+    );
+    const window = findBestWindow(dayHours);
+    const peakRainProbPct = dayHours.length
+      ? Math.max(...dayHours.map((p) => p.precipProbPct))
+      : 0;
+    outlook.push({ date, verdict: getDayVerdict(window), bestWindow: window, peakRainProbPct });
+  }
+
   return {
     coords,
     generatedAt: now.hourKey,
@@ -174,6 +209,7 @@ export function buildForecastView(coords: Coords, raw: OpenMeteoForecast): Forec
     recommendation,
     bestWindow,
     bestWindowIsTomorrow,
+    outlook,
   };
 }
 

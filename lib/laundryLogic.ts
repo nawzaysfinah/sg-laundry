@@ -111,8 +111,17 @@ export const LAUNDRY_CONFIG = {
   },
 
   notification: {
-    /** Rain probability that triggers a push. */
-    precipProbThresholdPct: 40,
+    /**
+     * Rain probability that triggers a push. Deliberately high: Open-Meteo's
+     * hourly probability sits in the 40-70% range on most humid SG afternoons
+     * without meaning rain is actually imminent where you are (SG convective
+     * storms are hyperlocal — one estate gets drenched, the next stays dry).
+     * A lower bar pings you near-daily during any unsettled stretch and
+     * trains you to ignore the alert entirely. 90% is the model saying "this
+     * is happening", not just "this is plausible" — it does get reached
+     * during real storm buildups, so this isn't so strict it never fires.
+     */
+    precipProbThresholdPct: 90,
     /** How many hours ahead the checker looks (1 = next hour only). */
     lookaheadHours: 2,
     /** Don't push again within this many minutes, even if it still qualifies. */
@@ -120,29 +129,46 @@ export const LAUNDRY_CONFIG = {
     /**
      * Quiet hours: only send *rain alerts* between these SG hours (inclusive
      * start, exclusive end). Set `enabled: false` to be woken at 3am. Does not
-     * apply to the morning report, which has its own time (below).
+     * apply to report slots, which each have their own time (below).
      */
     quietHours: { enabled: true, startHour: 7, endHour: 21 },
 
     /**
-     * Daily morning laundry report (Telegram).
+     * Daily laundry report (Telegram) — one or more named time slots, each
+     * sent at most once per calendar day per chat.
      *
-     * The report fires on the first checker run at or after `reportHour` SGT,
-     * but only within a `reportWindowHours` catch-up window — so if the
-     * scheduler was down all morning and first runs at 2pm, it skips today's
-     * report rather than sending a stale "good morning" in the afternoon.
-     * Sent exactly once per calendar day (tracked in Redis).
+     * A slot fires on the first checker run at or after `hour` SGT, but only
+     * within a `windowHours` catch-up window — so if the scheduler was down
+     * all morning and first runs at 2pm, it skips today's `morning` slot
+     * rather than sending a stale "good morning" hours late. `weekdaysOnly`
+     * skips Saturday/Sunday entirely (SG time) for slots tied to a workday
+     * routine.
+     *
+     * Add or remove slots freely — the cron route loops over whatever's here
+     * and tracks each slot's "already sent today" state independently, so a
+     * new slot doesn't need any other code changes.
      */
-    report: { enabled: true, reportHour: 8, reportWindowHours: 4 },
+    report: {
+      enabled: true,
+      slots: [
+        { name: "morning", hour: 8, windowHours: 4, weekdaysOnly: false },
+        // Evening check-in: covers after-work laundry and "is today's load
+        // still out there" — SG's 1-4pm storm pattern means a load hung at
+        // 9am is often still drying (or already rained on) by 6pm.
+        { name: "evening", hour: 18, windowHours: 3, weekdaysOnly: true },
+      ],
+    },
 
     /**
      * How long a /mute command in Telegram pauses rain alerts for. Does not
-     * affect the morning report — /mute is specifically "stop bugging me about
-     * rain right now", not "go silent entirely".
+     * affect report slots — /mute is specifically "stop bugging me about rain
+     * right now", not "go silent entirely".
      */
     muteDurationMinutes: 120,
   },
 } as const;
+
+export type ReportSlot = (typeof LAUNDRY_CONFIG.notification.report.slots)[number];
 
 // ---------------------------------------------------------------------------
 // Types
@@ -270,6 +296,23 @@ export function getRecommendation(
     headline: "Poor drying conditions",
     detail: "Humid and/or unsettled — consider indoors or the dryer.",
   };
+}
+
+/** The 3 states meaningful for summarising a *future* day, rather than right now. */
+export type DayVerdictLevel = "great" | "ok" | "poor";
+
+/**
+ * Verdict for a whole day, used by the multi-day report. Deliberately only
+ * the 3 score-based tiers from `getRecommendation` — "bring it in now" is a
+ * right-now urgency signal that doesn't mean anything for a day that hasn't
+ * happened yet, so it's dropped here rather than reused.
+ */
+export function getDayVerdict(bestWindow: BestWindow | null): DayVerdictLevel {
+  if (!bestWindow) return "poor"; // no viable window at all is definitionally a bad drying day
+  const r = LAUNDRY_CONFIG.recommendation;
+  if (bestWindow.averageScore >= r.greatMinScore) return "great";
+  if (bestWindow.averageScore >= r.okMinScore) return "ok";
+  return "poor";
 }
 
 /**

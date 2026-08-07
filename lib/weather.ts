@@ -76,7 +76,11 @@ export class OpenMeteoError extends Error {
 }
 
 /**
- * Fetch the 2-day hourly forecast for a point.
+ * Fetch the 3-day hourly forecast for a point.
+ *
+ * 3 days (today + the next 2) is what the Telegram bot's daily report needs to
+ * show a 3-day laundry outlook; the web app's 12-hour timeline only ever reads
+ * the first slice of it, so the extra days cost nothing there.
  *
  * `revalidate` drives Next's data cache: forecast data updates on a roughly
  * hourly cadence upstream, so caching for 10 minutes keeps the UI snappy and
@@ -93,7 +97,7 @@ export async function fetchForecast(
   url.searchParams.set("timezone", "Asia/Singapore");
   url.searchParams.set("current", CURRENT_FIELDS);
   url.searchParams.set("hourly", HOURLY_FIELDS);
-  url.searchParams.set("forecast_days", "2");
+  url.searchParams.set("forecast_days", "3");
 
   const res = await fetch(url, {
     next: { revalidate },

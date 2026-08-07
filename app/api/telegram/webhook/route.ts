@@ -26,7 +26,7 @@ import { NextResponse } from "next/server";
 import { getForecastView } from "@/lib/forecast";
 import { clampToSingapore, isInSingapore, roundCoords } from "@/lib/geo";
 import { LAUNDRY_CONFIG } from "@/lib/laundryLogic";
-import { buildHomeReply, buildMorningReport, buildNowReply, buildWindowReply } from "@/lib/report";
+import { buildDailyReport, buildHomeReply, buildNowReply, buildWindowReply } from "@/lib/report";
 import { secretMatches } from "@/lib/security";
 import { formatClock, sgNow } from "@/lib/sgTime";
 import {
@@ -76,7 +76,7 @@ const SETLOCATION_PROMPT =
 
 const COMMAND_LIST = [
   "/now — current rain &amp; drying conditions",
-  "/report — get today's laundry report on demand",
+  "/report — get the 3-day outlook on demand",
   "/window — best remaining drying window today",
   "/home — show your saved location",
   "/setlocation — set or change the location I watch",
@@ -147,10 +147,11 @@ async function handleCommand(chatId: string, command: string): Promise<string> {
       const view = await getForecastView(home);
       if (command === "now") return buildNowReply(view, home);
       if (command === "window") return buildWindowReply(view);
-      // /report reuses the exact same builder the daily cron job uses, called
-      // on demand — it deliberately does NOT touch this chat's "already sent
-      // today" state, so it can't cancel or duplicate the scheduled 8am send.
-      return buildMorningReport(view, home, sgNow().date);
+      // /report reuses the exact same builder the scheduled report slots use,
+      // called on demand — it deliberately does NOT touch this chat's
+      // "already sent today" state, so it can't cancel or duplicate a
+      // scheduled send.
+      return buildDailyReport(view, home, sgNow().date);
     }
 
     case "mute": {

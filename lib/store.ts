@@ -5,14 +5,16 @@
  * its own entry, keyed by chat id (as a string), in one hash per concern —
  * mirroring the pattern already used for Web Push subscriptions below.
  *
- *   laundry:tg:homes           hash   chatId → JSON HomeLocation
- *                               (this hash IS the registry of active users —
- *                               "registered" means "has a home entry")
- *   laundry:tg:lastRainAlertAt hash   chatId → ISO timestamp (per-user cooldown)
- *   laundry:tg:lastReportDate  hash   chatId → "YYYY-MM-DD" (per-user, once/day)
- *   laundry:tg:mutedUntil      hash   chatId → ISO timestamp (per-user /mute)
- *   laundry:subs               hash   subKey → JSON StoredSubscription
- *                               (Web Push — dormant, browser-based, no chat id)
+ *   laundry:tg:homes       hash   chatId → JSON HomeLocation
+ *                           (this hash IS the registry of active users —
+ *                           "registered" means "has a home entry")
+ *   laundry:tg:rainAlerts  hash   chatId → ISO timestamp (per-chat cooldown)
+ *   laundry:tg:reportDates hash   "chatId:slot" → "YYYY-MM-DD" (per report
+ *                           slot — e.g. "morning"/"evening" — so one slot
+ *                           firing doesn't block another the same day)
+ *   laundry:tg:muted       hash   chatId → ISO timestamp (per-chat /mute)
+ *   laundry:subs           hash   subKey → JSON StoredSubscription
+ *                           (Web Push — dormant, browser-based, no chat id)
  *
  * Upstash's REST client is used (rather than a TCP Redis client) specifically
  * because serverless functions have no stable connection lifecycle — each
@@ -23,6 +25,7 @@
 import { createHash } from "node:crypto";
 import { Redis } from "@upstash/redis";
 import type { Coords } from "./geo";
+import { LAUNDRY_CONFIG } from "./laundryLogic";
 
 const SUBS_KEY = "laundry:subs";
 const TG_HOMES_KEY = "laundry:tg:homes";
@@ -137,10 +140,16 @@ export async function getAllUserHomes(): Promise<Record<string, HomeLocation>> {
 export async function deleteUserData(chatId: string): Promise<void> {
   const redis = getRedis();
   if (!redis) return;
+  // Report dates are keyed "chatId:slot", not plain chatId — delete each
+  // configured slot's field explicitly so /stop doesn't leave orphaned state
+  // behind if slots were ever added or renamed.
+  const reportFields = LAUNDRY_CONFIG.notification.report.slots.map(
+    (slot) => `${chatId}:${slot.name}`
+  );
   await Promise.all([
     redis.hdel(TG_HOMES_KEY, chatId),
     redis.hdel(TG_RAIN_ALERT_KEY, chatId),
-    redis.hdel(TG_REPORT_DATE_KEY, chatId),
+    redis.hdel(TG_REPORT_DATE_KEY, ...reportFields),
     redis.hdel(TG_MUTED_UNTIL_KEY, chatId),
   ]);
 }
@@ -229,17 +238,29 @@ export async function setUserLastRainAlertAt(
   await redis.hset(TG_RAIN_ALERT_KEY, { [chatId]: at.toISOString() });
 }
 
-/** SG calendar date ("YYYY-MM-DD") this chat's morning report last went out. */
-export async function getUserLastReportDate(chatId: string): Promise<string | null> {
+/**
+ * SG calendar date ("YYYY-MM-DD") this chat last received a given report slot
+ * (e.g. "morning", "evening" — see LAUNDRY_CONFIG.notification.report.slots).
+ * Tracked per slot, not just per chat, so sending the morning report doesn't
+ * block the evening one on the same day, or vice versa.
+ */
+export async function getUserLastReportDate(
+  chatId: string,
+  slot: string
+): Promise<string | null> {
   const redis = getRedis();
   if (!redis) return null;
-  return (await redis.hget<string>(TG_REPORT_DATE_KEY, chatId)) ?? null;
+  return (await redis.hget<string>(TG_REPORT_DATE_KEY, `${chatId}:${slot}`)) ?? null;
 }
 
-export async function setUserLastReportDate(chatId: string, date: string): Promise<void> {
+export async function setUserLastReportDate(
+  chatId: string,
+  slot: string,
+  date: string
+): Promise<void> {
   const redis = getRedis();
   if (!redis) return;
-  await redis.hset(TG_REPORT_DATE_KEY, { [chatId]: date });
+  await redis.hset(TG_REPORT_DATE_KEY, { [`${chatId}:${slot}`]: date });
 }
 
 /** Set by /mute; this chat's rain alerts stay quiet until this time passes. */

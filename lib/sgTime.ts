@@ -94,3 +94,49 @@ export function currentHourIndex(times: string[], now: SgNow = sgNow()): number 
   const next = times.findIndex((t) => t >= now.hourKey);
   return next;
 }
+
+/**
+ * `sgDate` ("YYYY-MM-DD") plus/minus N days, computed in SG local terms — not
+ * a raw `Date` add, which would need to know a timezone offset to avoid
+ * drifting a day at the UTC boundary. Anchoring at SG noon (04:00 UTC) before
+ * adding days keeps every result comfortably clear of midnight in either
+ * timezone, and Singapore has no DST to complicate the arithmetic further.
+ */
+export function addDays(sgDate: string, days: number): string {
+  const anchored = new Date(`${sgDate}T12:00:00+08:00`);
+  anchored.setUTCDate(anchored.getUTCDate() + days);
+  const parts = partsFormatter.formatToParts(anchored);
+  const get = (type: Intl.DateTimeFormatPartTypes) =>
+    parts.find((p) => p.type === type)?.value ?? "00";
+  return `${get("year")}-${get("month")}-${get("day")}`;
+}
+
+const weekdayFormatter = new Intl.DateTimeFormat("en-US", {
+  timeZone: SG_TIMEZONE,
+  weekday: "short",
+});
+
+/** Is this SG date a Saturday or Sunday? Used to gate weekday-only report slots. */
+export function isWeekday(sgDate: string): boolean {
+  const day = weekdayFormatter.format(new Date(`${sgDate}T12:00:00+08:00`));
+  return day !== "Sat" && day !== "Sun";
+}
+
+const dateLabelFormatter = new Intl.DateTimeFormat("en-GB", {
+  timeZone: SG_TIMEZONE,
+  weekday: "short",
+  day: "numeric",
+  month: "short",
+});
+
+/** "Sat 25 Jul" from an SG date string "2026-07-25" — always the raw date, never "Today"/"Tomorrow". */
+export function formatDateLabel(sgDate: string): string {
+  return dateLabelFormatter.format(new Date(`${sgDate}T12:00:00+08:00`));
+}
+
+/** "Today", "Tomorrow", or "Thu 30 Jul" for any date further out. */
+export function dayLabel(sgDate: string, todaySgDate: string): string {
+  if (sgDate === todaySgDate) return "Today";
+  if (sgDate === addDays(todaySgDate, 1)) return "Tomorrow";
+  return formatDateLabel(sgDate);
+}
